@@ -422,7 +422,11 @@ def get_youtube_title(video_id: str) -> str:
 
 
 def _try_subtitle_api(video_id: str) -> dict | None:
-    """youtube-transcript-api で字幕テキストを取得する。成功時はdict、失敗時はNoneを返す。"""
+    """youtube-transcript-api で字幕テキストを取得する。
+    成功時は {"text", "lang", "source"} を返す。
+    IpBlocked の場合は {"ip_blocked": True} を返す。
+    その他の失敗時は None を返す。
+    """
     try:
         logger.info("[Step1:字幕API] %s: 字幕一覧を取得中...", video_id)
         api = YouTubeTranscriptApi()
@@ -443,7 +447,6 @@ def _try_subtitle_api(video_id: str) -> dict | None:
                         return t
             return items[0] if items else None
 
-        # 優先順位: 手動字幕(ja→en→他) → 自動生成字幕(ja→en→他)
         transcript = find_by_lang(manual) or find_by_lang(generated)
         if transcript is None:
             logger.warning("[Step1:字幕API] %s: 字幕トラックなし", video_id)
@@ -456,64 +459,92 @@ def _try_subtitle_api(video_id: str) -> dict | None:
         src = "自動生成字幕" if transcript.is_generated else "手動字幕"
         return {"text": text, "lang": transcript.language_code, "source": src}
     except Exception as e:
-        logger.warning("[Step1:字幕API] %s: %s: %s", video_id, type(e).__name__, str(e)[:150])
+        etype = type(e).__name__
+        logger.warning("[Step1:字幕API] %s: %s: %s", video_id, etype, str(e)[:150])
+        if "IpBlocked" in etype or "RequestBlocked" in etype or "429" in str(e):
+            return {"ip_blocked": True}
         return None
 
 
+def _get_cookies_args() -> list[str]:
+    """cookies.txt が存在すれば --cookies 引数を返す。なければ空リスト。"""
+    cookies_path = os.path.join(os.path.dirname(__file__), "cookies.txt")
+    if os.path.isfile(cookies_path):
+        logger.info("[Cookie] cookies.txt を使用: %s", cookies_path)
+        return ["--cookies", cookies_path]
+    return []
+
+
 def _try_yt_dlp_subtitles(video_id: str, tmp_dir: str) -> dict | None:
-    """yt-dlp で字幕ファイルをダウンロードして解析する。成功時はdict、失敗時はNoneを返す。"""
+    """yt-dlp で字幕ファイルをダウンロードして解析する。
+    cookies.txt があれば自動的に使用する。
+    成功時はdict、失敗時はNoneを返す。
+    """
     import subprocess
     os.makedirs(tmp_dir, exist_ok=True)
     out_path = os.path.join(tmp_dir, video_id)
     yt_url = f"https://www.youtube.com/watch?v={video_id}"
+
+    base_cmd = [
+        "yt-dlp", "--skip-download",
+        "--write-subs", "--write-auto-subs",
+        "--sub-langs", "ja,ja-JP,en",
+        "--sub-format", "json3",
+        "--no-abort-on-error",
+        "--socket-timeout", "15",
+    ]
+    base_cmd += _get_cookies_args()
+    base_cmd += ["-o", out_path, yt_url]
+
     try:
         logger.info("[Step2:yt-dlp字幕] %s: 字幕ファイルDL中...", video_id)
-        subprocess.run(
-            ["yt-dlp", "--skip-download",
-             "--write-subs", "--write-auto-subs",
-             "--sub-langs", "ja,ja-JP,en",
-             "--sub-format", "json3",
-             "--no-abort-on-error",
-             "--socket-timeout", "15",
-             "-o", out_path, yt_url],
-            capture_output=True, text=True, timeout=30,
-        )
+        subprocess.run(base_cmd, capture_output=True, text=True, timeout=30)
     except Exception as e:
         logger.warning("[Step2:yt-dlp字幕] %s: DLエラー: %s", video_id, e)
         return None
 
-    # ダウンロードされた字幕ファイルを探す（優先順: ja > en）
-    import json as json_mod
-    for lang in ["ja", "ja-JP", "en"]:
-        sub_file = f"{out_path}.{lang}.json3"
-        if os.path.isfile(sub_file) and os.path.getsize(sub_file) > 100:
-            try:
-                with open(sub_file, "r", encoding="utf-8") as f:
-                    data = json_mod.load(f)
-                texts = []
-                for ev in data.get("events", []):
-                    for seg in ev.get("segs", []):
-                        t = seg.get("utf8", "").strip()
-                        if t and t != "\n":
-                            texts.append(t)
-                if texts:
-                    combined = " ".join(texts)
-                    logger.info("[Step2:yt-dlp字幕] %s: 成功 lang=%s 文字数=%d", video_id, lang, len(combined))
-                    return {"text": combined, "lang": lang, "source": "yt-dlp字幕"}
-            except Exception as e:
-                logger.warning("[Step2:yt-dlp字幕] %s: 解析エラー: %s", video_id, e)
-            finally:
-                try:
-                    os.remove(sub_file)
-                except OSError:
-                    pass
-    # 見つからなかったファイルのクリーンアップ
+    # ダウンロードされた字幕ファイルを解析（優先順: ja > en）
+    result = _parse_subtitle_files(out_path, video_id)
+    if result:
+        return result
+
+    # クリーンアップ
     for ext in [".ja.json3", ".ja-JP.json3", ".en.json3"]:
         try:
             os.remove(out_path + ext)
         except OSError:
             pass
     logger.warning("[Step2:yt-dlp字幕] %s: 字幕ファイルなし", video_id)
+    return None
+
+
+def _parse_subtitle_files(out_path: str, video_id: str) -> dict | None:
+    """ダウンロード済みの字幕json3ファイルを解析してテキストを返す。"""
+    import json as json_mod
+    for lang in ["ja", "ja-JP", "en"]:
+        sub_file = f"{out_path}.{lang}.json3"
+        if not os.path.isfile(sub_file) or os.path.getsize(sub_file) < 100:
+            continue
+        try:
+            with open(sub_file, "r", encoding="utf-8") as f:
+                data = json_mod.load(f)
+            texts = []
+            for ev in data.get("events", []):
+                for seg in ev.get("segs", []):
+                    t = seg.get("utf8", "").strip()
+                    if t and t != "\n":
+                        texts.append(t)
+            if texts:
+                combined = " ".join(texts)
+                logger.info("[Step2:yt-dlp字幕] %s: 成功 lang=%s 文字数=%d", video_id, lang, len(combined))
+                return {"text": combined, "lang": lang, "source": "yt-dlp字幕"}
+        except Exception as e:
+            logger.warning("[Step2:yt-dlp字幕] %s: 解析エラー: %s", video_id, e)
+        finally:
+            try:
+                os.remove(sub_file)
+            except OSError:
+                pass
     return None
 
 
@@ -530,12 +561,15 @@ def get_youtube_transcript(video_id: str, tmp_dir: str = None, allow_whisper: bo
         tmp_dir = os.path.join(os.path.dirname(__file__), "tmp_audio")
 
     # --- Step 1: youtube-transcript-api ---
+    ip_blocked = False
     result = _try_subtitle_api(video_id)
-    if result:
+    if result and "ip_blocked" not in result:
         return {"title": title, "text": result["text"], "lang": result["lang"],
                 "error": None, "source": result["source"]}
+    if result and result.get("ip_blocked"):
+        ip_blocked = True
 
-    # --- Step 2: yt-dlp 字幕ファイル ---
+    # --- Step 2: yt-dlp 字幕ファイル（cookies.txt対応） ---
     result = _try_yt_dlp_subtitles(video_id, tmp_dir)
     if result:
         return {"title": title, "text": result["text"], "lang": result["lang"],
@@ -544,9 +578,15 @@ def get_youtube_transcript(video_id: str, tmp_dir: str = None, allow_whisper: bo
     # --- Step 3: yt-dlp 音声 + Whisper（明示的に許可された場合のみ） ---
     if not allow_whisper:
         logger.info("[字幕取得失敗] %s: 字幕が取得できませんでした（Whisperは未許可）", video_id)
-        return {"title": title, "text": None, "lang": "",
-                "error": "字幕を取得できませんでした（YouTubeのIP制限の可能性があります）。音声認識で文字起こしするには「音声認識を許可」をONにしてください",
-                "needs_whisper": True}
+        if ip_blocked:
+            has_cookies = os.path.isfile(os.path.join(os.path.dirname(__file__), "cookies.txt"))
+            if has_cookies:
+                msg = "YouTubeのIP制限により字幕を取得できませんでした（cookies.txt使用済み）。cookies.txtの有効期限が切れている可能性があります。音声認識で文字起こしするには「音声認識を許可」をONにしてください"
+            else:
+                msg = "YouTubeのIP制限により字幕を取得できませんでした。ブラウザでYouTubeにログイン後、cookies.txtをアプリフォルダに配置すると改善する場合があります。または「音声認識を許可」をONにしてください"
+        else:
+            msg = "字幕を取得できませんでした。音声認識で文字起こしするには「音声認識を許可」をONにしてください"
+        return {"title": title, "text": None, "lang": "", "error": msg, "needs_whisper": True}
 
     logger.info("[Step3:Whisper] %s: 字幕取得不可のため音声文字起こしに切替", video_id)
     yt_url = f"https://www.youtube.com/watch?v={video_id}"
@@ -737,12 +777,11 @@ def transcribe_audio(url: str, tmp_dir: str) -> dict:
     os.makedirs(tmp_dir, exist_ok=True)
     out_template = os.path.join(tmp_dir, "%(title)s.%(ext)s")
     try:
-        result = subprocess.run(
-            ["yt-dlp", "--no-playlist", "-x", "--audio-format", "wav",
-             "--socket-timeout", "30",
-             "-o", out_template, "--print", "after_move:filepath", url],
-            capture_output=True, text=True, timeout=120
-        )
+        cmd = ["yt-dlp", "--no-playlist", "-x", "--audio-format", "wav",
+               "--socket-timeout", "30"]
+        cmd += _get_cookies_args()
+        cmd += ["-o", out_template, "--print", "after_move:filepath", url]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         filepath = result.stdout.strip().split('\n')[-1]
         if not os.path.isfile(filepath):
             wavs = [f for f in os.listdir(tmp_dir) if f.endswith('.wav')]
