@@ -1,0 +1,11 @@
+services:
+  video-transcriber:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      # ホストのフォルダをコンテナにマウント（フォルダ指定機能で使用）
+      # 必要に応じてパスを変更してください
+      - "${VIDEO_DIR:-./videos}:/videos"
+      - "${OUTPUT_DIR:-./output}:/output"
+    restart: unless-stopped

@@ -1,0 +1,782 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>動画文字起こしツール</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', 'Meiryo', sans-serif;
+            background: #1a1a2e;
+            color: #e0e0e0;
+            min-height: 100vh;
+        }
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 24px 16px;
+        }
+        h1 {
+            text-align: center;
+            font-size: 1.6rem;
+            margin-bottom: 24px;
+            color: #e94560;
+        }
+        /* タブ */
+        .tabs {
+            display: flex;
+            gap: 0;
+            margin-bottom: 20px;
+            border-radius: 10px;
+            overflow: hidden;
+            border: 1px solid #2a2a4a;
+        }
+        .tab {
+            flex: 1;
+            padding: 14px;
+            text-align: center;
+            cursor: pointer;
+            background: #16213e;
+            font-weight: 600;
+            font-size: 0.95rem;
+            transition: background 0.2s;
+            border: none;
+            color: #888;
+        }
+        .tab:hover { background: #1a2a4e; }
+        .tab.active { background: #e94560; color: #fff; }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        /* 共通 */
+        .input-section {
+            background: #16213e;
+            border-radius: 12px;
+            padding: 24px;
+            margin-bottom: 20px;
+        }
+        .input-group { margin-bottom: 16px; }
+        .input-group:last-child { margin-bottom: 0; }
+        .input-group label {
+            display: block;
+            margin-bottom: 6px;
+            font-size: 0.9rem;
+            color: #aaa;
+        }
+        .input-row { display: flex; gap: 10px; }
+        .input-row input { flex: 1; }
+        input[type="text"] {
+            width: 100%;
+            padding: 12px 16px;
+            border: 1px solid #333;
+            border-radius: 8px;
+            background: #0f3460;
+            color: #fff;
+            font-size: 1rem;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+        input[type="text"]:focus { border-color: #e94560; }
+        input[type="text"]::placeholder { color: #666; }
+        .btn {
+            padding: 12px 28px;
+            border: none;
+            border-radius: 8px;
+            font-size: 1rem;
+            cursor: pointer;
+            transition: background 0.2s, transform 0.1s;
+            font-weight: 600;
+            white-space: nowrap;
+        }
+        .btn:active { transform: scale(0.97); }
+        .btn-primary { background: #e94560; color: #fff; }
+        .btn-primary:hover { background: #c73e54; }
+        .btn-primary:disabled { background: #555; cursor: not-allowed; }
+        .btn-secondary { background: #533483; color: #fff; }
+        .btn-secondary:hover { background: #6b44a0; }
+        .btn-download { background: #0f3460; color: #fff; border: 1px solid #e94560; }
+        .btn-download:hover { background: #1a4a80; }
+        .btn-danger { background: transparent; color: #e94560; border: 1px solid #e94560; }
+        .btn-danger:hover { background: rgba(233, 69, 96, 0.15); }
+        .btn-delete-card {
+            background: none; border: none; color: #666;
+            font-size: 1.1rem; cursor: pointer; padding: 4px 8px;
+            border-radius: 4px; flex-shrink: 0;
+        }
+        .btn-delete-card:hover { color: #e94560; background: rgba(233, 69, 96, 0.15); }
+        .btn-sm { padding: 8px 16px; font-size: 0.85rem; }
+        /* プログレス */
+        .progress-bar {
+            display: none;
+            margin-bottom: 20px;
+            background: #16213e;
+            border-radius: 12px;
+            padding: 16px 24px;
+        }
+        .progress-text { margin-bottom: 8px; font-size: 0.95rem; }
+        .progress-track { height: 8px; background: #0f3460; border-radius: 4px; overflow: hidden; }
+        .progress-fill {
+            height: 100%; background: linear-gradient(90deg, #e94560, #533483);
+            border-radius: 4px; transition: width 0.3s; width: 0%;
+        }
+        /* ステータス */
+        .status-message {
+            text-align: center; padding: 12px; margin-bottom: 16px;
+            border-radius: 8px; display: none;
+        }
+        .status-message.error { background: rgba(233, 69, 96, 0.2); border: 1px solid #e94560; color: #ff6b81; }
+        .status-message.success { background: rgba(46, 213, 115, 0.2); border: 1px solid #2ed573; color: #7bed9f; }
+        .status-message.info { background: rgba(83, 52, 131, 0.2); border: 1px solid #533483; color: #a78bfa; }
+        /* ツールバー */
+        .toolbar { display: flex; justify-content: flex-end; gap: 10px; margin-bottom: 16px; }
+        /* 結果カード */
+        .results { display: flex; flex-direction: column; gap: 16px; }
+        .card {
+            background: #16213e; border-radius: 12px; overflow: hidden;
+            border: 1px solid #2a2a4a; transition: border-color 0.2s;
+        }
+        .card:hover { border-color: #533483; }
+        .card-header {
+            display: flex; align-items: center; gap: 12px;
+            padding: 16px 20px; cursor: pointer; user-select: none;
+        }
+        .card-icon {
+            width: 40px; height: 40px; border-radius: 8px;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 1.2rem; flex-shrink: 0;
+        }
+        .card-icon.youtube { background: rgba(255, 0, 0, 0.2); }
+        .card-icon.video { background: rgba(138, 43, 226, 0.2); }
+        .card-icon.audio { background: rgba(30, 144, 255, 0.2); }
+        .card-info { flex: 1; min-width: 0; }
+        .card-title {
+            font-weight: 600; font-size: 1rem;
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }
+        .card-meta { font-size: 0.8rem; color: #888; margin-top: 2px; }
+        .card-lang {
+            padding: 4px 10px; border-radius: 12px; font-size: 0.75rem;
+            background: rgba(233, 69, 96, 0.2); color: #e94560; white-space: nowrap;
+        }
+        .card-toggle { color: #888; font-size: 1.2rem; transition: transform 0.2s; }
+        .card-toggle.open { transform: rotate(180deg); }
+        .card-body { display: none; padding: 0 20px 16px; }
+        .card-body.open { display: block; }
+        .card-text {
+            background: #0f3460; border-radius: 8px; padding: 16px;
+            font-size: 0.9rem; line-height: 1.7; white-space: pre-wrap;
+            word-break: break-word; max-height: 400px; overflow-y: auto;
+        }
+        .card-error {
+            color: #ff6b81; font-size: 0.85rem; padding: 8px 12px;
+            background: rgba(233, 69, 96, 0.1); border-radius: 6px;
+        }
+        .card-text::-webkit-scrollbar { width: 6px; }
+        .card-text::-webkit-scrollbar-track { background: transparent; }
+        .card-text::-webkit-scrollbar-thumb { background: #533483; border-radius: 3px; }
+        /* 検索結果 */
+        .search-results { display: flex; flex-direction: column; gap: 8px; }
+        .search-item {
+            display: flex; align-items: center; gap: 12px;
+            background: #16213e; border-radius: 10px; padding: 12px 16px;
+            border: 1px solid #2a2a4a; transition: border-color 0.2s;
+        }
+        .search-item:hover { border-color: #533483; }
+        .search-item input[type="checkbox"] {
+            width: 20px; height: 20px; accent-color: #e94560;
+            cursor: pointer; flex-shrink: 0;
+        }
+        .search-thumb {
+            width: 80px; height: 45px; border-radius: 6px;
+            object-fit: cover; flex-shrink: 0; background: #0f3460;
+        }
+        .search-info { flex: 1; min-width: 0; }
+        .search-title {
+            font-weight: 600; font-size: 0.9rem;
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }
+        .search-channel { font-size: 0.78rem; color: #888; margin-top: 2px; }
+        .search-duration {
+            font-size: 0.75rem; color: #a78bfa; background: rgba(83,52,131,0.3);
+            padding: 2px 8px; border-radius: 8px; white-space: nowrap;
+        }
+        .search-toolbar {
+            display: flex; justify-content: space-between; align-items: center;
+            gap: 10px; margin-bottom: 12px; flex-wrap: wrap;
+        }
+        .search-toolbar-left { display: flex; align-items: center; gap: 10px; }
+        .search-toolbar-right { display: flex; gap: 10px; }
+        .select-count { font-size: 0.9rem; color: #aaa; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>&#127909; 動画文字起こしツール</h1>
+
+        <div class="tabs">
+            <button class="tab active" onclick="switchTab('url')">URL解析</button>
+            <button class="tab" onclick="switchTab('search')">キーワード検索</button>
+            <button class="tab" onclick="switchTab('folder')">フォルダ指定</button>
+        </div>
+
+        <!-- URL解析タブ -->
+        <div class="tab-content active" id="tab-url">
+            <div class="input-section">
+                <div class="input-group">
+                    <label>WebページのURL</label>
+                    <div class="input-row">
+                        <input type="text" id="urlInput" placeholder="https://example.com/page-with-videos">
+                        <button class="btn btn-primary" id="analyzeBtn" onclick="startAnalysis()">解析開始</button>
+                    </div>
+                </div>
+                <div class="input-group">
+                    <label>保存先フォルダ（任意）</label>
+                    <input type="text" id="saveDirInput" placeholder="C:\Users\Owner\Documents\transcripts">
+                </div>
+            </div>
+        </div>
+
+        <!-- キーワード検索タブ -->
+        <div class="tab-content" id="tab-search">
+            <div class="input-section">
+                <div class="input-group">
+                    <label>検索キーワード（YouTube動画を検索）</label>
+                    <div class="input-row">
+                        <input type="text" id="searchInput" placeholder="例：meditation yoga lecture">
+                        <button class="btn btn-secondary" id="searchBtn" onclick="startSearch()">検索</button>
+                    </div>
+                </div>
+                <div class="input-group">
+                    <label>保存先フォルダ（任意）</label>
+                    <input type="text" id="searchSaveDirInput" placeholder="C:\Users\Owner\Documents\transcripts">
+                </div>
+            </div>
+
+            <div id="searchResultsArea" style="display:none">
+                <div class="search-toolbar">
+                    <div class="search-toolbar-left">
+                        <label style="cursor:pointer;display:flex;align-items:center;gap:6px">
+                            <input type="checkbox" id="selectAllCb" onchange="toggleSelectAll()" style="width:18px;height:18px;accent-color:#e94560;cursor:pointer">
+                            全選択
+                        </label>
+                        <span class="select-count" id="selectCount">0件選択中</span>
+                    </div>
+                    <div class="search-toolbar-right">
+                        <button class="btn btn-primary btn-sm" onclick="transcribeSelected()">選択した動画を文字起こし</button>
+                        <button class="btn btn-danger btn-sm" onclick="deleteSelectedSearch()">選択を削除</button>
+                        <button class="btn btn-danger btn-sm" onclick="clearSearch()">一括削除</button>
+                    </div>
+                </div>
+                <div class="search-results" id="searchResults"></div>
+            </div>
+        </div>
+
+        <!-- フォルダ指定タブ -->
+        <div class="tab-content" id="tab-folder">
+            <div class="input-section">
+                <div class="input-group">
+                    <label>動画フォルダのパス</label>
+                    <div class="input-row">
+                        <input type="text" id="folderInput" placeholder="C:\Users\Owner\Videos">
+                        <button class="btn btn-primary" id="scanBtn" onclick="startScanFolder()">スキャン</button>
+                    </div>
+                </div>
+                <div class="input-group">
+                    <label>保存先フォルダ（任意）</label>
+                    <input type="text" id="folderSaveDirInput" placeholder="C:\Users\Owner\Documents\transcripts">
+                </div>
+            </div>
+
+            <div id="folderResultsArea" style="display:none">
+                <div class="search-toolbar">
+                    <div class="search-toolbar-left">
+                        <label style="cursor:pointer;display:flex;align-items:center;gap:6px">
+                            <input type="checkbox" id="folderSelectAllCb" onchange="toggleFolderSelectAll()" style="width:18px;height:18px;accent-color:#e94560;cursor:pointer">
+                            全選択
+                        </label>
+                        <span class="select-count" id="folderSelectCount">0件選択中</span>
+                    </div>
+                    <div class="search-toolbar-right">
+                        <button class="btn btn-primary btn-sm" onclick="transcribeFolder()">選択した動画を文字起こし</button>
+                        <button class="btn btn-danger btn-sm" onclick="deleteSelectedFolder()">選択を削除</button>
+                        <button class="btn btn-danger btn-sm" onclick="clearFolder()">一括削除</button>
+                    </div>
+                </div>
+                <div class="search-results" id="folderResults"></div>
+            </div>
+        </div>
+
+        <div class="status-message" id="statusMsg"></div>
+
+        <div class="progress-bar" id="progressBar">
+            <div class="progress-text" id="progressText">処理中...</div>
+            <div class="progress-track">
+                <div class="progress-fill" id="progressFill"></div>
+            </div>
+        </div>
+
+        <div class="toolbar" id="toolbar" style="display:none">
+            <button class="btn btn-download" onclick="downloadAll()">&#128190; TXTで保存</button>
+            <button class="btn btn-danger" onclick="clearAll()">&#128465; 一括削除</button>
+        </div>
+
+        <div class="results" id="results"></div>
+    </div>
+
+    <script>
+        let ws = null;
+        let allResults = [];
+        let searchData = [];
+        let folderData = [];
+
+        function switchTab(tab) {
+            const tabs = ['url', 'search', 'folder'];
+            document.querySelectorAll('.tab').forEach((t, i) => {
+                t.classList.toggle('active', tab === tabs[i]);
+            });
+            tabs.forEach(t => {
+                document.getElementById('tab-' + t).classList.toggle('active', tab === t);
+            });
+        }
+
+        function showStatus(msg, type) {
+            const el = document.getElementById('statusMsg');
+            el.textContent = msg;
+            el.className = 'status-message ' + type;
+            el.style.display = 'block';
+        }
+        function hideStatus() {
+            document.getElementById('statusMsg').style.display = 'none';
+        }
+
+        function getWs() {
+            return new Promise((resolve, reject) => {
+                const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+                const w = new WebSocket(`${proto}//${location.host}/ws`);
+                w.onopen = () => resolve(w);
+                w.onerror = () => { showStatus('WebSocket接続エラー', 'error'); reject(); };
+            });
+        }
+
+        // ===== URL解析 =====
+        async function startAnalysis() {
+            const url = document.getElementById('urlInput').value.trim();
+            const saveDir = document.getElementById('saveDirInput').value.trim();
+            if (!url) { showStatus('URLを入力してください', 'error'); return; }
+            hideStatus();
+            allResults = [];
+            document.getElementById('results').innerHTML = '';
+            document.getElementById('toolbar').style.display = 'none';
+            document.getElementById('analyzeBtn').disabled = true;
+            document.getElementById('progressBar').style.display = 'block';
+            document.getElementById('progressFill').style.width = '0%';
+            document.getElementById('progressText').textContent = 'ページを取得中...';
+            try {
+                ws = await getWs();
+            } catch { resetUI(); return; }
+            ws.onmessage = (event) => handleMessage(JSON.parse(event.data));
+            ws.onclose = () => { document.getElementById('analyzeBtn').disabled = false; };
+            ws.send(JSON.stringify({ action: 'analyze', url, save_dir: saveDir }));
+        }
+
+        // ===== キーワード検索 =====
+        async function startSearch() {
+            const query = document.getElementById('searchInput').value.trim();
+            if (!query) { showStatus('検索キーワードを入力してください', 'error'); return; }
+            hideStatus();
+            searchData = [];
+            document.getElementById('searchResults').innerHTML = '';
+            document.getElementById('searchResultsArea').style.display = 'none';
+            document.getElementById('searchBtn').disabled = true;
+            showStatus('検索中...', 'info');
+            try {
+                ws = await getWs();
+            } catch { document.getElementById('searchBtn').disabled = false; return; }
+            ws.onmessage = (event) => {
+                const msg = JSON.parse(event.data);
+                if (msg.type === 'search_results') {
+                    hideStatus();
+                    searchData = msg.data;
+                    renderSearchResults(msg.data);
+                    document.getElementById('searchBtn').disabled = false;
+                } else if (msg.type === 'error') {
+                    showStatus(msg.message, 'error');
+                    document.getElementById('searchBtn').disabled = false;
+                } else {
+                    handleMessage(msg);
+                }
+            };
+            ws.onclose = () => { document.getElementById('searchBtn').disabled = false; };
+            ws.send(JSON.stringify({ action: 'search', query }));
+        }
+
+        function formatDuration(sec) {
+            if (!sec) return '';
+            const m = Math.floor(sec / 60);
+            const s = sec % 60;
+            return `${m}:${String(s).padStart(2, '0')}`;
+        }
+
+        function renderSearchResults(items) {
+            const container = document.getElementById('searchResults');
+            container.innerHTML = '';
+            document.getElementById('searchResultsArea').style.display = 'block';
+            document.getElementById('selectAllCb').checked = false;
+            items.forEach((item, idx) => {
+                const div = document.createElement('div');
+                div.className = 'search-item';
+                div.innerHTML = `
+                    <input type="checkbox" class="search-cb" data-idx="${idx}" onchange="updateSelectCount()">
+                    ${item.thumbnail ? `<img class="search-thumb" src="${escapeHtml(item.thumbnail)}" alt="">` : '<div class="search-thumb"></div>'}
+                    <div class="search-info">
+                        <div class="search-title" title="${escapeHtml(item.title)}">${escapeHtml(item.title)}</div>
+                        <div class="search-channel">${escapeHtml(item.channel || '')}</div>
+                    </div>
+                    ${item.duration ? `<span class="search-duration">${formatDuration(item.duration)}</span>` : ''}
+                    <button class="btn-delete-card" onclick="deleteSearchItem(this)" title="この結果を削除">&#10005;</button>
+                `;
+                container.appendChild(div);
+            });
+            updateSelectCount();
+        }
+
+        function toggleSelectAll() {
+            const checked = document.getElementById('selectAllCb').checked;
+            document.querySelectorAll('.search-cb').forEach(cb => cb.checked = checked);
+            updateSelectCount();
+        }
+
+        function updateSelectCount() {
+            const count = document.querySelectorAll('.search-cb:checked').length;
+            document.getElementById('selectCount').textContent = `${count}件選択中`;
+        }
+
+        function deleteSearchItem(btn) {
+            const item = btn.closest('.search-item');
+            item.remove();
+            rebuildSearchData();
+        }
+
+        function deleteSelectedSearch() {
+            const checked = document.querySelectorAll('.search-cb:checked');
+            if (checked.length === 0) { showStatus('削除する項目を選択してください', 'error'); return; }
+            checked.forEach(cb => cb.closest('.search-item').remove());
+            rebuildSearchData();
+        }
+
+        function clearSearch() {
+            document.getElementById('searchResults').innerHTML = '';
+            searchData = [];
+            document.getElementById('searchResultsArea').style.display = 'none';
+            document.getElementById('selectAllCb').checked = false;
+            updateSelectCount();
+            hideStatus();
+        }
+
+        function rebuildSearchData() {
+            const items = document.querySelectorAll('.search-item');
+            const newData = [];
+            items.forEach((item, i) => {
+                const cb = item.querySelector('.search-cb');
+                const oldIdx = parseInt(cb.dataset.idx);
+                if (searchData[oldIdx]) newData.push(searchData[oldIdx]);
+                cb.dataset.idx = i;
+            });
+            searchData = newData;
+            updateSelectCount();
+            if (searchData.length === 0) {
+                document.getElementById('searchResultsArea').style.display = 'none';
+            }
+        }
+
+        async function transcribeSelected() {
+            const checked = document.querySelectorAll('.search-cb:checked');
+            if (checked.length === 0) { showStatus('文字起こしする動画を選択してください', 'error'); return; }
+            const saveDir = document.getElementById('searchSaveDirInput').value.trim();
+            const items = Array.from(checked).map(cb => {
+                const idx = parseInt(cb.dataset.idx);
+                const d = searchData[idx];
+                return { type: 'youtube', video_id: d.video_id, title: d.title, url: d.url };
+            });
+            hideStatus();
+            allResults = [];
+            document.getElementById('results').innerHTML = '';
+            document.getElementById('toolbar').style.display = 'none';
+            document.getElementById('progressBar').style.display = 'block';
+            document.getElementById('progressFill').style.width = '0%';
+            document.getElementById('progressText').textContent = '文字起こし準備中...';
+            try {
+                ws = await getWs();
+            } catch { resetUI(); return; }
+            ws.onmessage = (event) => handleMessage(JSON.parse(event.data));
+            ws.onclose = () => resetUI();
+            ws.send(JSON.stringify({ action: 'transcribe_selected', items, save_dir: saveDir }));
+        }
+
+        // ===== 共通ハンドラ =====
+        function handleMessage(msg) {
+            switch (msg.type) {
+                case 'status':
+                    showStatus(msg.message, 'info');
+                    break;
+                case 'progress':
+                    document.getElementById('progressBar').style.display = 'block';
+                    document.getElementById('progressText').textContent = msg.message;
+                    const pct = (msg.current / msg.total) * 100;
+                    document.getElementById('progressFill').style.width = pct + '%';
+                    break;
+                case 'result':
+                    allResults.push(msg.data);
+                    addCard(msg.data);
+                    break;
+                case 'complete':
+                    document.getElementById('progressBar').style.display = 'none';
+                    let completeMsg = `処理完了: ${msg.success}/${msg.total}件の文字起こしに成功`;
+                    if (msg.failed > 0) {
+                        completeMsg += ` | ${msg.failed}件失敗`;
+                    }
+                    if (msg.saved_count) {
+                        completeMsg += ` | ${msg.saved_count}件保存完了: ${msg.save_dir}`;
+                    }
+                    showStatus(completeMsg, msg.failed > 0 && msg.success > 0 ? 'info' : 'success');
+                    if (allResults.some(r => r.text)) {
+                        document.getElementById('toolbar').style.display = 'flex';
+                    }
+                    resetUI();
+                    break;
+                case 'error':
+                    showStatus(msg.message, 'error');
+                    resetUI();
+                    break;
+            }
+        }
+
+        function resetUI() {
+            document.getElementById('analyzeBtn').disabled = false;
+            document.getElementById('searchBtn').disabled = false;
+            document.getElementById('scanBtn').disabled = false;
+            document.getElementById('progressBar').style.display = 'none';
+        }
+
+        function addCard(data) {
+            const container = document.getElementById('results');
+            const card = document.createElement('div');
+            card.className = 'card';
+            const iconClass = data.type === 'youtube' ? 'youtube' : (data.type === 'video' || data.type === 'local_video') ? 'video' : 'audio';
+            const iconEmoji = data.type === 'youtube' ? '&#9654;' : (data.type === 'video' || data.type === 'local_video') ? '&#127910;' : '&#127925;';
+            const hasText = !!data.text;
+            card.innerHTML = `
+                <div class="card-header" onclick="toggleCard(this)">
+                    <div class="card-icon ${iconClass}">${iconEmoji}</div>
+                    <div class="card-info">
+                        <div class="card-title">${escapeHtml(data.title)}</div>
+                        <div class="card-meta">${escapeHtml(data.url || '')}</div>
+                    </div>
+                    ${data.lang_ja ? `<span class="card-lang">${escapeHtml(data.lang_ja)}</span>` : ''}
+                    <span class="card-toggle">&#9660;</span>
+                    <button class="btn-delete-card" onclick="deleteCard(event, this)" title="この結果を削除">&#10005;</button>
+                </div>
+                <div class="card-body">
+                    ${data.error ? `<div class="card-error">&#9888; ${escapeHtml(data.error)}</div>` : ''}
+                    ${data.save_error ? `<div class="card-error">&#9888; ${escapeHtml(data.save_error)}</div>` : ''}
+                    ${data.chunk_info ? `<div style="color:#a78bfa;font-size:0.8rem;margin-bottom:8px">&#9881; ${escapeHtml(data.chunk_info)}</div>` : ''}
+                    ${data.saved_path ? `<div style="color:#7bed9f;font-size:0.8rem;margin-bottom:8px">&#9989; 保存済: ${escapeHtml(data.saved_path)}</div>` : ''}
+                    ${hasText ? `<div class="card-text">${escapeHtml(data.text)}</div>` : ''}
+                </div>
+            `;
+            container.appendChild(card);
+        }
+
+        function toggleCard(header) {
+            const body = header.nextElementSibling;
+            const toggle = header.querySelector('.card-toggle');
+            body.classList.toggle('open');
+            toggle.classList.toggle('open');
+        }
+
+        function escapeHtml(str) {
+            const d = document.createElement('div');
+            d.textContent = str;
+            return d.innerHTML;
+        }
+
+        function deleteCard(event, btn) {
+            event.stopPropagation();
+            const card = btn.closest('.card');
+            const cards = Array.from(document.querySelectorAll('#results .card'));
+            const idx = cards.indexOf(card);
+            if (idx >= 0) allResults.splice(idx, 1);
+            card.remove();
+            updateToolbar();
+        }
+
+        function clearAll() {
+            allResults = [];
+            document.getElementById('results').innerHTML = '';
+            updateToolbar();
+            hideStatus();
+        }
+
+        function updateToolbar() {
+            document.getElementById('toolbar').style.display = allResults.length > 0 ? 'flex' : 'none';
+        }
+
+        function downloadAll() {
+            const now = new Date();
+            const dateStr = `${now.getFullYear()}/${String(now.getMonth()+1).padStart(2,'0')}/${String(now.getDate()).padStart(2,'0')} ${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}`;
+            let content = '';
+            for (const r of allResults) {
+                if (!r.text) continue;
+                content += `=== ${r.title} ===\n`;
+                content += `取得日時：${dateStr}\n`;
+                content += `URL：${r.url || ''}\n`;
+                content += `言語：${r.lang_ja || '言語不明'}（自動検出）\n\n`;
+                content += `【文字起こし全文】\n${r.text}\n\n---\n\n`;
+            }
+            if (!content) { showStatus('ダウンロードするテキストがありません', 'error'); return; }
+            const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            const ds = `${now.getFullYear()}${String(now.getMonth()+1).padStart(2,'0')}${String(now.getDate()).padStart(2,'0')}`;
+            a.download = `文字起こし_${ds}.txt`;
+            a.click();
+            URL.revokeObjectURL(a.href);
+        }
+
+        // ===== フォルダ指定 =====
+        async function startScanFolder() {
+            const folder = document.getElementById('folderInput').value.trim();
+            if (!folder) { showStatus('フォルダパスを入力してください', 'error'); return; }
+            hideStatus();
+            folderData = [];
+            document.getElementById('folderResults').innerHTML = '';
+            document.getElementById('folderResultsArea').style.display = 'none';
+            document.getElementById('scanBtn').disabled = true;
+            showStatus('フォルダをスキャン中...', 'info');
+            try {
+                ws = await getWs();
+            } catch { document.getElementById('scanBtn').disabled = false; return; }
+            ws.onmessage = (event) => {
+                const msg = JSON.parse(event.data);
+                if (msg.type === 'folder_scan_results') {
+                    hideStatus();
+                    folderData = msg.data;
+                    renderFolderResults(msg.data);
+                    showStatus(`${msg.data.length}件の動画ファイルを検出しました`, 'success');
+                    document.getElementById('scanBtn').disabled = false;
+                } else if (msg.type === 'error') {
+                    showStatus(msg.message, 'error');
+                    document.getElementById('scanBtn').disabled = false;
+                } else {
+                    handleMessage(msg);
+                }
+            };
+            ws.onclose = () => { document.getElementById('scanBtn').disabled = false; };
+            ws.send(JSON.stringify({ action: 'scan_folder', folder }));
+        }
+
+        function renderFolderResults(items) {
+            const container = document.getElementById('folderResults');
+            container.innerHTML = '';
+            document.getElementById('folderResultsArea').style.display = 'block';
+            document.getElementById('folderSelectAllCb').checked = false;
+            items.forEach((item, idx) => {
+                const div = document.createElement('div');
+                div.className = 'search-item';
+                const splitBadge = item.needs_split
+                    ? '<span style="font-size:0.7rem;color:#ffa502;background:rgba(255,165,2,0.15);padding:2px 6px;border-radius:6px;white-space:nowrap">auto split</span>'
+                    : '';
+                const durText = item.duration_display ? ` | ${item.duration_display}` : '';
+                div.innerHTML = `
+                    <input type="checkbox" class="folder-cb" data-idx="${idx}" onchange="updateFolderSelectCount()" checked>
+                    <div class="card-icon video" style="width:40px;height:40px;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:1.1rem;flex-shrink:0">&#127910;</div>
+                    <div class="search-info">
+                        <div class="search-title" title="${escapeHtml(item.filename)}">${escapeHtml(item.filename)}</div>
+                        <div class="search-channel">${escapeHtml(item.size_display || '')}${durText}</div>
+                    </div>
+                    ${splitBadge}
+                    <button class="btn-delete-card" onclick="deleteFolderItem(this)" title="この結果を削除">&#10005;</button>
+                `;
+                container.appendChild(div);
+            });
+            document.getElementById('folderSelectAllCb').checked = true;
+            updateFolderSelectCount();
+        }
+
+        function toggleFolderSelectAll() {
+            const checked = document.getElementById('folderSelectAllCb').checked;
+            document.querySelectorAll('.folder-cb').forEach(cb => cb.checked = checked);
+            updateFolderSelectCount();
+        }
+
+        function updateFolderSelectCount() {
+            const count = document.querySelectorAll('.folder-cb:checked').length;
+            document.getElementById('folderSelectCount').textContent = `${count}件選択中`;
+        }
+
+        function deleteFolderItem(btn) {
+            btn.closest('.search-item').remove();
+            rebuildFolderData();
+        }
+
+        function deleteSelectedFolder() {
+            const checked = document.querySelectorAll('.folder-cb:checked');
+            if (checked.length === 0) { showStatus('削除する項目を選択してください', 'error'); return; }
+            checked.forEach(cb => cb.closest('.search-item').remove());
+            rebuildFolderData();
+        }
+
+        function clearFolder() {
+            document.getElementById('folderResults').innerHTML = '';
+            folderData = [];
+            document.getElementById('folderResultsArea').style.display = 'none';
+            document.getElementById('folderSelectAllCb').checked = false;
+            updateFolderSelectCount();
+            hideStatus();
+        }
+
+        function rebuildFolderData() {
+            const items = document.querySelectorAll('#folderResults .search-item');
+            const newData = [];
+            items.forEach((item, i) => {
+                const cb = item.querySelector('.folder-cb');
+                const oldIdx = parseInt(cb.dataset.idx);
+                if (folderData[oldIdx]) newData.push(folderData[oldIdx]);
+                cb.dataset.idx = i;
+            });
+            folderData = newData;
+            updateFolderSelectCount();
+            if (folderData.length === 0) {
+                document.getElementById('folderResultsArea').style.display = 'none';
+            }
+        }
+
+        async function transcribeFolder() {
+            const checked = document.querySelectorAll('.folder-cb:checked');
+            if (checked.length === 0) { showStatus('文字起こしするファイルを選択してください', 'error'); return; }
+            const saveDir = document.getElementById('folderSaveDirInput').value.trim();
+            const items = Array.from(checked).map(cb => {
+                const idx = parseInt(cb.dataset.idx);
+                return folderData[idx];
+            });
+            hideStatus();
+            allResults = [];
+            document.getElementById('results').innerHTML = '';
+            document.getElementById('toolbar').style.display = 'none';
+            document.getElementById('progressBar').style.display = 'block';
+            document.getElementById('progressFill').style.width = '0%';
+            document.getElementById('progressText').textContent = '文字起こし準備中...';
+            try {
+                ws = await getWs();
+            } catch { resetUI(); return; }
+            ws.onmessage = (event) => handleMessage(JSON.parse(event.data));
+            ws.onclose = () => resetUI();
+            ws.send(JSON.stringify({ action: 'transcribe_folder', items, save_dir: saveDir }));
+        }
+
+        document.getElementById('urlInput').addEventListener('keydown', e => { if (e.key === 'Enter') startAnalysis(); });
+        document.getElementById('searchInput').addEventListener('keydown', e => { if (e.key === 'Enter') startSearch(); });
+        document.getElementById('folderInput').addEventListener('keydown', e => { if (e.key === 'Enter') startScanFolder(); });
+    </script>
+</body>
+</html>
