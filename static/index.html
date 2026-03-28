@@ -257,6 +257,12 @@
                     <label>保存先フォルダ（任意）</label>
                     <input type="text" id="saveDirInput" placeholder="C:\Users\Owner\Documents\transcripts">
                 </div>
+                <div class="input-group" style="margin-top:12px">
+                    <label style="cursor:pointer;display:flex;align-items:center;gap:8px;font-size:0.85rem;color:#aaa">
+                        <input type="checkbox" id="allowWhisperUrl" style="width:16px;height:16px;accent-color:#e94560;cursor:pointer">
+                        音声認識を許可（字幕が取得できない場合にWhisperで文字起こし。時間がかかります）
+                    </label>
+                </div>
             </div>
         </div>
 
@@ -273,6 +279,12 @@
                 <div class="input-group">
                     <label>保存先フォルダ（任意）</label>
                     <input type="text" id="searchSaveDirInput" placeholder="C:\Users\Owner\Documents\transcripts">
+                </div>
+                <div class="input-group" style="margin-top:12px">
+                    <label style="cursor:pointer;display:flex;align-items:center;gap:8px;font-size:0.85rem;color:#aaa">
+                        <input type="checkbox" id="allowWhisperSearch" style="width:16px;height:16px;accent-color:#e94560;cursor:pointer">
+                        音声認識を許可（字幕が取得できない場合にWhisperで文字起こし。時間がかかります）
+                    </label>
                 </div>
             </div>
 
@@ -461,7 +473,7 @@
             ws.onmessage = (event) => handleMessage(JSON.parse(event.data));
             ws.onclose = () => { document.getElementById('directTranscribeBtn').disabled = false; };
             resetWsTimer();
-            ws.send(JSON.stringify({ action: 'transcribe_url', urls, save_dir: saveDir }));
+            ws.send(JSON.stringify({ action: 'transcribe_url', urls, save_dir: saveDir, allow_whisper: document.getElementById('allowWhisperUrl').checked }));
         }
 
         // ===== URL��析 =====
@@ -483,7 +495,7 @@
             ws.onmessage = (event) => handleMessage(JSON.parse(event.data));
             ws.onclose = () => { document.getElementById('analyzeBtn').disabled = false; };
             resetWsTimer();
-            ws.send(JSON.stringify({ action: 'analyze', url, save_dir: saveDir }));
+            ws.send(JSON.stringify({ action: 'analyze', url, save_dir: saveDir, allow_whisper: document.getElementById('allowWhisperUrl').checked }));
         }
 
         // ===== キーワード検索 =====
@@ -619,7 +631,7 @@
             ws.onmessage = (event) => handleMessage(JSON.parse(event.data));
             ws.onclose = () => resetUI();
             resetWsTimer();
-            ws.send(JSON.stringify({ action: 'transcribe_selected', items, save_dir: saveDir }));
+            ws.send(JSON.stringify({ action: 'transcribe_selected', items, save_dir: saveDir, allow_whisper: document.getElementById('allowWhisperSearch').checked }));
         }
 
         // ===== 共通ハンドラ =====
