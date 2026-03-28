@@ -579,13 +579,9 @@ def get_youtube_transcript(video_id: str, tmp_dir: str = None, allow_whisper: bo
     if not allow_whisper:
         logger.info("[字幕取得失敗] %s: 字幕が取得できませんでした（Whisperは未許可）", video_id)
         if ip_blocked:
-            has_cookies = os.path.isfile(os.path.join(os.path.dirname(__file__), "cookies.txt"))
-            if has_cookies:
-                msg = "YouTubeのIP制限により字幕を取得できませんでした（cookies.txt使用済み）。cookies.txtの有効期限が切れている可能性があります。音声認識で文字起こしするには「音声認識を許可」をONにしてください"
-            else:
-                msg = "YouTubeのIP制限により字幕を取得できませんでした。ブラウザでYouTubeにログイン後、cookies.txtをアプリフォルダに配置すると改善する場合があります。または「音声認識を許可」をONにしてください"
+            msg = "YouTubeの字幕APIがIP制限されているため字幕を取得できません。「音声認識を許可」をONにすると、音声をダウンロードしてWhisperで文字起こしします（数分かかります）"
         else:
-            msg = "字幕を取得できませんでした。音声認識で文字起こしするには「音声認識を許可」をONにしてください"
+            msg = "字幕を取得できませんでした。「音声認識を許可」をONにしてください"
         return {"title": title, "text": None, "lang": "", "error": msg, "needs_whisper": True}
 
     logger.info("[Step3:Whisper] %s: 字幕取得不可のため音声文字起こしに切替", video_id)
