@@ -8,6 +8,7 @@ import ipaddress
 import logging
 from pathlib import Path
 from typing import Optional
+from functools import partial
 from urllib.parse import urlparse
 
 import requests
@@ -21,7 +22,9 @@ from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api.formatters import TextFormatter
 from playwright.async_api import async_playwright
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("video-transcriber")
+logger.setLevel(logging.INFO)
 
 # ============================================================
 # セキュリティ設定
@@ -418,31 +421,138 @@ def get_youtube_title(video_id: str) -> str:
     return f"YouTube_{video_id}"
 
 
-def get_youtube_transcript(video_id: str) -> dict:
+def _try_subtitle_api(video_id: str) -> dict | None:
+    """youtube-transcript-api で字幕テキストを取得する。成功時はdict、失敗時はNoneを返す。"""
+    try:
+        logger.info("[Step1:字幕API] %s: 字幕一覧を取得中...", video_id)
+        api = YouTubeTranscriptApi()
+        transcript_list = api.list(video_id)
+
+        manual, generated, available = [], [], []
+        for t in transcript_list:
+            available.append(f"{t.language_code}({'auto' if t.is_generated else 'manual'})")
+            (generated if t.is_generated else manual).append(t)
+        logger.info("[Step1:字幕API] %s: 利用可能=[%s]", video_id, ", ".join(available))
+
+        preferred = ("ja", "ja-JP", "en")
+
+        def find_by_lang(items):
+            for lang in preferred:
+                for t in items:
+                    if t.language_code == lang or t.language_code.startswith(lang.split("-")[0]):
+                        return t
+            return items[0] if items else None
+
+        # 優先順位: 手動字幕(ja→en→他) → 自動生成字幕(ja→en→他)
+        transcript = find_by_lang(manual) or find_by_lang(generated)
+        if transcript is None:
+            logger.warning("[Step1:字幕API] %s: 字幕トラックなし", video_id)
+            return None
+
+        logger.info("[Step1:字幕API] %s: fetch中 lang=%s auto=%s", video_id, transcript.language_code, transcript.is_generated)
+        fetched = transcript.fetch()
+        text = TextFormatter().format_transcript(fetched)
+        logger.info("[Step1:字幕API] %s: 成功 lang=%s 文字数=%d", video_id, transcript.language_code, len(text))
+        src = "自動生成字幕" if transcript.is_generated else "手動字幕"
+        return {"text": text, "lang": transcript.language_code, "source": src}
+    except Exception as e:
+        logger.warning("[Step1:字幕API] %s: %s: %s", video_id, type(e).__name__, str(e)[:150])
+        return None
+
+
+def _try_yt_dlp_subtitles(video_id: str, tmp_dir: str) -> dict | None:
+    """yt-dlp で字幕ファイルをダウンロードして解析する。成功時はdict、失敗時はNoneを返す。"""
+    import subprocess
+    os.makedirs(tmp_dir, exist_ok=True)
+    out_path = os.path.join(tmp_dir, video_id)
+    yt_url = f"https://www.youtube.com/watch?v={video_id}"
+    try:
+        logger.info("[Step2:yt-dlp字幕] %s: 字幕ファイルDL中...", video_id)
+        subprocess.run(
+            ["yt-dlp", "--skip-download",
+             "--write-subs", "--write-auto-subs",
+             "--sub-langs", "ja,ja-JP,en",
+             "--sub-format", "json3",
+             "--no-abort-on-error",
+             "--socket-timeout", "15",
+             "-o", out_path, yt_url],
+            capture_output=True, text=True, timeout=30,
+        )
+    except Exception as e:
+        logger.warning("[Step2:yt-dlp字幕] %s: DLエラー: %s", video_id, e)
+        return None
+
+    # ダウンロードされた字幕ファイルを探す（優先順: ja > en）
+    import json as json_mod
+    for lang in ["ja", "ja-JP", "en"]:
+        sub_file = f"{out_path}.{lang}.json3"
+        if os.path.isfile(sub_file) and os.path.getsize(sub_file) > 100:
+            try:
+                with open(sub_file, "r", encoding="utf-8") as f:
+                    data = json_mod.load(f)
+                texts = []
+                for ev in data.get("events", []):
+                    for seg in ev.get("segs", []):
+                        t = seg.get("utf8", "").strip()
+                        if t and t != "\n":
+                            texts.append(t)
+                if texts:
+                    combined = " ".join(texts)
+                    logger.info("[Step2:yt-dlp字幕] %s: 成功 lang=%s 文字数=%d", video_id, lang, len(combined))
+                    return {"text": combined, "lang": lang, "source": "yt-dlp字幕"}
+            except Exception as e:
+                logger.warning("[Step2:yt-dlp字幕] %s: 解析エラー: %s", video_id, e)
+            finally:
+                try:
+                    os.remove(sub_file)
+                except OSError:
+                    pass
+    # 見つからなかったファイルのクリーンアップ
+    for ext in [".ja.json3", ".ja-JP.json3", ".en.json3"]:
+        try:
+            os.remove(out_path + ext)
+        except OSError:
+            pass
+    logger.warning("[Step2:yt-dlp字幕] %s: 字幕ファイルなし", video_id)
+    return None
+
+
+def get_youtube_transcript(video_id: str, tmp_dir: str = None) -> dict:
+    """YouTube字幕取得（3段階フォールバック）:
+    1. youtube-transcript-api（数秒）
+    2. yt-dlp 字幕ファイルDL（数秒）
+    3. yt-dlp 音声DL + Whisper（数分）
+    """
     if not validate_youtube_id(video_id):
         return {"title": f"YouTube_{video_id[:20]}", "text": None, "lang": "", "error": "不正な動画IDです"}
     title = get_youtube_title(video_id)
-    try:
-        api = YouTubeTranscriptApi()
-        transcript_list = api.list(video_id)
-        manual = None
-        generated = None
-        for t in transcript_list:
-            if not t.is_generated and manual is None:
-                manual = t
-            elif t.is_generated and generated is None:
-                generated = t
-        transcript = manual or generated
-        if transcript is None:
-            return {"title": title, "text": None, "lang": "", "error": "字幕が見つかりません"}
-        lang_code = transcript.language_code
-        fetched = transcript.fetch()
-        formatter = TextFormatter()
-        text = formatter.format_transcript(fetched)
-        return {"title": title, "text": text, "lang": lang_code, "error": None}
-    except Exception as e:
-        logger.warning("YouTube transcript error for %s: %s", video_id, e)
-        return {"title": title, "text": None, "lang": "", "error": sanitize_error(str(e))}
+    if tmp_dir is None:
+        tmp_dir = os.path.join(os.path.dirname(__file__), "tmp_audio")
+
+    # --- Step 1: youtube-transcript-api ---
+    result = _try_subtitle_api(video_id)
+    if result:
+        return {"title": title, "text": result["text"], "lang": result["lang"],
+                "error": None, "source": result["source"]}
+
+    # --- Step 2: yt-dlp 字幕ファイル ---
+    result = _try_yt_dlp_subtitles(video_id, tmp_dir)
+    if result:
+        return {"title": title, "text": result["text"], "lang": result["lang"],
+                "error": None, "source": result["source"]}
+
+    # --- Step 3: yt-dlp 音声 + Whisper ---
+    logger.info("[Step3:Whisper] %s: 字幕取得不可のため音声文字起こしに切替", video_id)
+    yt_url = f"https://www.youtube.com/watch?v={video_id}"
+    tr = transcribe_audio(yt_url, tmp_dir)
+    if tr["text"]:
+        logger.info("[Step3:Whisper] %s: 成功 lang=%s 文字数=%d", video_id, tr.get("lang", ""), len(tr["text"]))
+        return {"title": title, "text": tr["text"], "lang": tr.get("lang", ""),
+                "error": "(字幕取得不可のため音声から文字起こし)", "source": "Whisper音声認識"}
+    else:
+        logger.warning("[Step3:Whisper] %s: 失敗: %s", video_id, tr.get("error", ""))
+        return {"title": title, "text": None, "lang": "",
+                "error": f"字幕取得・音声文字起こしともに失敗: {tr.get('error', '不明')}"}
 
 
 VIDEO_EXTENSIONS = {'.mp4', '.webm', '.mkv', '.avi', '.mov', '.wmv', '.m4v', '.flv', '.ts', '.mts', '.m2ts'}
@@ -623,8 +733,9 @@ def transcribe_audio(url: str, tmp_dir: str) -> dict:
     try:
         result = subprocess.run(
             ["yt-dlp", "--no-playlist", "-x", "--audio-format", "wav",
+             "--socket-timeout", "30",
              "-o", out_template, "--print", "after_move:filepath", url],
-            capture_output=True, text=True, timeout=300
+            capture_output=True, text=True, timeout=120
         )
         filepath = result.stdout.strip().split('\n')[-1]
         if not os.path.isfile(filepath):
@@ -638,7 +749,7 @@ def transcribe_audio(url: str, tmp_dir: str) -> dict:
                 else:
                     return {"text": None, "lang": "", "error": "ダウンロード失敗: 音声ファイルを取得できませんでした"}
     except subprocess.TimeoutExpired:
-        return {"text": None, "lang": "", "error": "ダウンロードエラー: タイムアウトしました（5分超過）"}
+        return {"text": None, "lang": "", "error": "ダウンロードエラー: タイムアウトしました（2分超過）"}
     except Exception as e:
         logger.warning("Audio download error: %s", e)
         return {"text": None, "lang": "", "error": "ダウンロードエラー: 音声の取得に失敗しました"}
@@ -743,6 +854,19 @@ def search_youtube(query: str, max_results: int = 20) -> list[dict]:
         return []
 
 
+# 1件あたりの処理タイムアウト（秒）— Whisperフォールバック時は数分かかるため余裕を持つ
+PER_ITEM_TIMEOUT = 600
+
+
+async def run_with_timeout(func, *args, timeout=PER_ITEM_TIMEOUT):
+    """run_in_executor にタイムアウトを付けて実行する"""
+    loop = asyncio.get_event_loop()
+    return await asyncio.wait_for(
+        loop.run_in_executor(None, func),
+        timeout=timeout,
+    )
+
+
 # ============================================================
 # ルート
 # ============================================================
@@ -809,47 +933,53 @@ async def websocket_endpoint(websocket: WebSocket):
                 saved_count = 0
                 tmp_dir = os.path.join(os.path.dirname(__file__), "tmp_audio")
                 for i, item in enumerate(items):
+                    if i > 0 and item.get("type", "youtube") == "youtube":
+                        await asyncio.sleep(2.0)
                     batch_num = i // BATCH_SIZE + 1
-                    batch_label = f"[バッチ{batch_num}/{batch_count}] " if batch_count > 1 else ""
-                    progress_msg = f"{batch_label}{i+1}件目/{total}件を処理中"
+                    batch_label = f"[{batch_num}/{batch_count}] " if batch_count > 1 else ""
+                    progress_msg = f"{batch_label}{i+1}/{total}件 処理中..."
                     await websocket.send_json({"type": "progress", "current": i+1, "total": total, "message": progress_msg})
                     vid = item.get("video_id", "")
                     title = item.get("title", "不明")
                     item_type = item.get("type", "youtube")
-                    if item_type == "youtube" and vid:
-                        if not validate_youtube_id(vid):
-                            result = {"index": i, "type": "youtube", "title": title, "url": "", "lang": "", "lang_ja": "", "text": None, "error": "不正な動画IDです"}
+                    result = None
+                    try:
+                        if item_type == "youtube" and vid:
+                            if not validate_youtube_id(vid):
+                                result = {"index": i, "type": "youtube", "title": title, "url": "", "lang": "", "lang_ja": "", "text": None, "error": "不正な動画IDです"}
+                            else:
+                                yt_url = f"https://www.youtube.com/watch?v={vid}"
+                                tr = await run_with_timeout(partial(get_youtube_transcript, vid, tmp_dir=tmp_dir))
+                                result = {
+                                    "index": i, "type": "youtube",
+                                    "title": tr["title"], "url": yt_url,
+                                    "lang": tr["lang"], "lang_ja": get_language_name_ja(tr["lang"]),
+                                    "text": tr["text"], "error": tr["error"], "source": tr.get("source", ""),
+                                }
                         else:
-                            yt_url = f"https://www.youtube.com/watch?v={vid}"
-                            loop = asyncio.get_event_loop()
-                            tr = await loop.run_in_executor(None, get_youtube_transcript, vid)
-                            result = {
-                                "index": i, "type": "youtube",
-                                "title": tr["title"], "url": yt_url,
-                                "lang": tr["lang"], "lang_ja": get_language_name_ja(tr["lang"]),
-                                "text": tr["text"], "error": tr["error"],
-                            }
-                    else:
-                        media_url = item.get("url", "")
-                        url_valid, url_err = validate_url(media_url)
-                        if not url_valid:
-                            result = {"index": i, "type": item_type, "title": title, "url": media_url, "lang": "", "lang_ja": "", "text": None, "error": url_err}
-                        else:
-                            loop = asyncio.get_event_loop()
-                            tr = await loop.run_in_executor(None, transcribe_audio, media_url, tmp_dir)
-                            result = {
-                                "index": i, "type": item_type,
-                                "title": title, "url": media_url,
-                                "lang": tr["lang"], "lang_ja": get_language_name_ja(tr.get("lang", "")),
-                                "text": tr["text"], "error": tr["error"],
-                            }
-                    if tr_info := (result.get("chunks_total")):
-                        result["chunk_info"] = f"分割処理: {result.get('chunks_success', 0)}/{tr_info}チャンク成功"
-                    if result["text"] and save_dir:
+                            media_url = item.get("url", "")
+                            url_valid, url_err = validate_url(media_url)
+                            if not url_valid:
+                                result = {"index": i, "type": item_type, "title": title, "url": media_url, "lang": "", "lang_ja": "", "text": None, "error": url_err}
+                            else:
+                                tr = await run_with_timeout(partial(transcribe_audio, media_url, tmp_dir))
+                                result = {
+                                    "index": i, "type": item_type,
+                                    "title": title, "url": media_url,
+                                    "lang": tr["lang"], "lang_ja": get_language_name_ja(tr.get("lang", "")),
+                                    "text": tr["text"], "error": tr["error"], "source": tr.get("source", ""),
+                                }
+                    except asyncio.TimeoutError:
+                        logger.warning("Timeout processing item %d: %s", i, title)
+                        result = {"index": i, "type": item_type, "title": title, "url": item.get("url", ""), "lang": "", "lang_ja": "", "text": None, "error": f"タイムアウト: 処理が{PER_ITEM_TIMEOUT}秒以内に完了しませんでした"}
+                    except Exception as e:
+                        logger.error("Unexpected error processing item %d: %s", i, e)
+                        result = {"index": i, "type": item_type, "title": title, "url": item.get("url", ""), "lang": "", "lang_ja": "", "text": None, "error": "予期しないエラーが発生しました"}
+                    if result and result.get("chunks_total"):
+                        result["chunk_info"] = f"分割処理: {result.get('chunks_success', 0)}/{result['chunks_total']}チャンク成功"
+                    if result and result.get("text") and save_dir:
                         try:
-                            saved_path = await asyncio.get_event_loop().run_in_executor(
-                                None, save_result_file, result, save_dir
-                            )
+                            saved_path = await run_with_timeout(partial(save_result_file, result, save_dir), timeout=30)
                             result["saved_path"] = saved_path
                             saved_count += 1
                         except Exception as e:
@@ -947,6 +1077,88 @@ async def websocket_endpoint(websocket: WebSocket):
                     summary["save_dir"] = save_dir
                 await websocket.send_json(summary)
 
+            elif action == "transcribe_url":
+                urls = data.get("urls", [])
+                save_dir = data.get("save_dir", "").strip()
+                valid, err = validate_save_dir(save_dir)
+                if not valid:
+                    await websocket.send_json({"type": "error", "message": err})
+                    continue
+                if not urls or not isinstance(urls, list):
+                    await websocket.send_json({"type": "error", "message": "URLが指定されていません"})
+                    continue
+                # 各URLをYouTube動画IDまたはメディアURLとして分類
+                items = []
+                for u in urls:
+                    u = u.strip()
+                    if not u:
+                        continue
+                    vid = None
+                    m = re.search(r'(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/|youtube\.com/v/)([a-zA-Z0-9_-]{11})', u)
+                    if m:
+                        vid = m.group(1)
+                    if vid:
+                        items.append({"type": "youtube", "video_id": vid, "title": "", "url": u})
+                    else:
+                        items.append({"type": "media", "url": u, "title": os.path.basename(urlparse(u).path) or "media"})
+                if not items:
+                    await websocket.send_json({"type": "error", "message": "有効なURLがありませ���"})
+                    continue
+                total = len(items)
+                results = []
+                saved_count = 0
+                tmp_dir = os.path.join(os.path.dirname(__file__), "tmp_audio")
+                for i, item in enumerate(items):
+                    if i > 0 and item["type"] == "youtube":
+                        await asyncio.sleep(2.0)
+                    await websocket.send_json({"type": "progress", "current": i+1, "total": total, "message": f"{i+1}/{total}件 処理中..."})
+                    result = None
+                    try:
+                        if item["type"] == "youtube":
+                            tr = await run_with_timeout(partial(get_youtube_transcript, item["video_id"], tmp_dir=tmp_dir))
+                            result = {
+                                "index": i, "type": "youtube",
+                                "title": tr["title"], "url": item["url"],
+                                "lang": tr["lang"], "lang_ja": get_language_name_ja(tr["lang"]),
+                                "text": tr["text"], "error": tr["error"], "source": tr.get("source", ""),
+                            }
+                        else:
+                            media_url = item["url"]
+                            url_valid, url_err = validate_url(media_url)
+                            if not url_valid:
+                                result = {"index": i, "type": "media", "title": item.get("title", "media"), "url": media_url, "lang": "", "lang_ja": "", "text": None, "error": url_err}
+                            else:
+                                tr = await run_with_timeout(partial(transcribe_audio, media_url, tmp_dir))
+                                result = {
+                                    "index": i, "type": item.get("type", "media"),
+                                    "title": item.get("title", "media"), "url": media_url,
+                                    "lang": tr["lang"], "lang_ja": get_language_name_ja(tr.get("lang", "")),
+                                    "text": tr["text"], "error": tr["error"], "source": tr.get("source", ""),
+                                }
+                    except asyncio.TimeoutError:
+                        logger.warning("Timeout processing URL item %d", i)
+                        result = {"index": i, "type": item.get("type", "media"), "title": item.get("title", ""), "url": item.get("url", ""), "lang": "", "lang_ja": "", "text": None, "error": f"タイムアウト: 処理が{PER_ITEM_TIMEOUT}秒以内に完了しませんでした"}
+                    except Exception as e:
+                        logger.error("Unexpected error processing URL item %d: %s", i, e)
+                        result = {"index": i, "type": item.get("type", "media"), "title": item.get("title", ""), "url": item.get("url", ""), "lang": "", "lang_ja": "", "text": None, "error": "予期しないエラーが発生しました"}
+                    if result and result.get("text") and save_dir:
+                        try:
+                            saved_path = await run_with_timeout(partial(save_result_file, result, save_dir), timeout=30)
+                            result["saved_path"] = saved_path
+                            saved_count += 1
+                        except Exception as e:
+                            logger.warning("Save error: %s", e)
+                            result["save_error"] = "保存エラー: ファイルの保存に失敗しました"
+                    results.append(result)
+                    await websocket.send_json({"type": "result", "data": result})
+                summary = {"type": "complete", "total": total,
+                           "success": sum(1 for r in results if r.get("text")),
+                           "failed": sum(1 for r in results if not r.get("text"))}
+                if save_dir and saved_count > 0:
+                    summary["saved_count"] = saved_count
+                    summary["save_dir"] = save_dir
+                await websocket.send_json(summary)
+
             elif action == "analyze":
                 url = data.get("url", "").strip()
                 save_dir = data.get("save_dir", "").strip()
@@ -996,51 +1208,48 @@ async def websocket_endpoint(websocket: WebSocket):
                 tmp_dir = os.path.join(os.path.dirname(__file__), "tmp_audio")
 
                 for i, item in enumerate(all_items):
+                    if i > 0 and item["type"] == "youtube":
+                        await asyncio.sleep(2.0)
                     batch_num = i // BATCH_SIZE + 1
-                    batch_label = f"[バッチ{batch_num}/{batch_count}] " if batch_count > 1 else ""
-                    progress_msg = f"{batch_label}{i+1}件目/{total}件を処理中"
+                    batch_label = f"[{batch_num}/{batch_count}] " if batch_count > 1 else ""
+                    progress_msg = f"{batch_label}{i+1}/{total}件 処理中..."
                     await websocket.send_json({"type": "progress", "current": i+1, "total": total, "message": progress_msg})
 
-                    if item["type"] == "youtube":
-                        vid = item["video_id"]
-                        yt_url = f"https://www.youtube.com/watch?v={vid}"
+                    result = None
+                    try:
+                        if item["type"] == "youtube":
+                            vid = item["video_id"]
+                            yt_url = f"https://www.youtube.com/watch?v={vid}"
+                            tr = await run_with_timeout(partial(get_youtube_transcript, vid, tmp_dir=tmp_dir))
+                            result = {
+                                "index": i, "type": "youtube",
+                                "title": tr["title"], "url": yt_url,
+                                "lang": tr["lang"], "lang_ja": get_language_name_ja(tr["lang"]),
+                                "text": tr["text"], "error": tr["error"], "source": tr.get("source", ""),
+                            }
+                        elif item["type"] in ("audio", "video"):
+                            media_url = item["url"]
+                            media_title = item.get("title", item["type"])
+                            tr = await run_with_timeout(partial(transcribe_audio, media_url, tmp_dir))
+                            result = {
+                                "index": i, "type": item["type"],
+                                "title": media_title, "url": media_url,
+                                "lang": tr["lang"], "lang_ja": get_language_name_ja(tr.get("lang", "")),
+                                "text": tr["text"], "error": tr["error"], "source": tr.get("source", ""),
+                            }
+                    except asyncio.TimeoutError:
+                        logger.warning("Timeout processing analyze item %d", i)
+                        result = {"index": i, "type": item.get("type", ""), "title": item.get("title", ""), "url": item.get("url", ""), "lang": "", "lang_ja": "", "text": None, "error": f"タイムアウト: 処理が{PER_ITEM_TIMEOUT}秒以内に完了しませんでした"}
+                    except Exception as e:
+                        logger.error("Unexpected error in analyze item %d: %s", i, e)
+                        result = {"index": i, "type": item.get("type", ""), "title": item.get("title", ""), "url": item.get("url", ""), "lang": "", "lang_ja": "", "text": None, "error": "予期しないエラーが発生しました"}
 
-                        loop = asyncio.get_event_loop()
-                        tr = await loop.run_in_executor(None, get_youtube_transcript, vid)
+                    if result is None:
+                        result = {"index": i, "type": item.get("type", ""), "title": item.get("title", ""), "url": item.get("url", ""), "lang": "", "lang_ja": "", "text": None, "error": "不明なエラー"}
 
-                        result = {
-                            "index": i,
-                            "type": "youtube",
-                            "title": tr["title"],
-                            "url": yt_url,
-                            "lang": tr["lang"],
-                            "lang_ja": get_language_name_ja(tr["lang"]),
-                            "text": tr["text"],
-                            "error": tr["error"],
-                        }
-                    elif item["type"] in ("audio", "video"):
-                        media_url = item["url"]
-                        media_title = item.get("title", item["type"])
-
-                        loop = asyncio.get_event_loop()
-                        tr = await loop.run_in_executor(None, transcribe_audio, media_url, tmp_dir)
-
-                        result = {
-                            "index": i,
-                            "type": item["type"],
-                            "title": media_title,
-                            "url": media_url,
-                            "lang": tr["lang"],
-                            "lang_ja": get_language_name_ja(tr.get("lang", "")),
-                            "text": tr["text"],
-                            "error": tr["error"],
-                        }
-
-                    if result["text"] and save_dir:
+                    if result.get("text") and save_dir:
                         try:
-                            saved_path = await asyncio.get_event_loop().run_in_executor(
-                                None, save_result_file, result, save_dir
-                            )
+                            saved_path = await run_with_timeout(partial(save_result_file, result, save_dir), timeout=30)
                             result["saved_path"] = saved_path
                             saved_count += 1
                         except Exception as e:
