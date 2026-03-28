@@ -764,10 +764,19 @@ def transcribe_audio(url: str, tmp_dir: str) -> dict:
     try:
         cmd = ["yt-dlp", "--no-playlist", "-x", "--audio-format", "wav",
                "--socket-timeout", "30"]
-        cmd += _get_cookies_args()
+        # 注意: cookies.txtは音声DLでは使わない（Cookie付きだとフォーマット取得が失敗するため）
         cmd += ["-o", out_template, "--print", "after_move:filepath", url]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        filepath = result.stdout.strip().split('\n')[-1]
+        result = subprocess.run(cmd, capture_output=True, timeout=120)
+        # Windows環境ではcp932で出力されるため、複数エンコーディングで試行
+        stdout_raw = result.stdout
+        filepath = ""
+        for enc in ["utf-8", "cp932", "shift_jis"]:
+            try:
+                filepath = stdout_raw.decode(enc).strip().split('\n')[-1].strip()
+                if os.path.isfile(filepath):
+                    break
+            except (UnicodeDecodeError, ValueError):
+                continue
         if not os.path.isfile(filepath):
             wavs = [f for f in os.listdir(tmp_dir) if f.endswith('.wav')]
             if wavs:
