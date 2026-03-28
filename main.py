@@ -548,11 +548,11 @@ def _parse_subtitle_files(out_path: str, video_id: str) -> dict | None:
     return None
 
 
-def get_youtube_transcript(video_id: str, tmp_dir: str = None, allow_whisper: bool = False) -> dict:
-    """YouTube字幕取得（3段階フォールバック）:
+def get_youtube_transcript(video_id: str, tmp_dir: str = None, **_kwargs) -> dict:
+    """YouTube字幕取得（3段階フォールバック・自動）:
     1. youtube-transcript-api（数秒）
     2. yt-dlp 字幕ファイルDL（数秒）
-    3. yt-dlp 音声DL + Whisper（数分）— allow_whisper=True の場合のみ
+    3. yt-dlp 音声DL + Whisper（数分）— 1,2失敗時に自動実行
     """
     if not validate_youtube_id(video_id):
         return {"title": f"YouTube_{video_id[:20]}", "text": None, "lang": "", "error": "不正な動画IDです"}
@@ -561,13 +561,10 @@ def get_youtube_transcript(video_id: str, tmp_dir: str = None, allow_whisper: bo
         tmp_dir = os.path.join(os.path.dirname(__file__), "tmp_audio")
 
     # --- Step 1: youtube-transcript-api ---
-    ip_blocked = False
     result = _try_subtitle_api(video_id)
     if result and "ip_blocked" not in result:
         return {"title": title, "text": result["text"], "lang": result["lang"],
                 "error": None, "source": result["source"]}
-    if result and result.get("ip_blocked"):
-        ip_blocked = True
 
     # --- Step 2: yt-dlp 字幕ファイル（cookies.txt対応） ---
     result = _try_yt_dlp_subtitles(video_id, tmp_dir)
@@ -575,16 +572,8 @@ def get_youtube_transcript(video_id: str, tmp_dir: str = None, allow_whisper: bo
         return {"title": title, "text": result["text"], "lang": result["lang"],
                 "error": None, "source": result["source"]}
 
-    # --- Step 3: yt-dlp 音声 + Whisper（明示的に許可された場合のみ） ---
-    if not allow_whisper:
-        logger.info("[字幕取得失敗] %s: 字幕が取得できませんでした（Whisperは未許可）", video_id)
-        if ip_blocked:
-            msg = "YouTubeの字幕APIがIP制限されているため字幕を取得できません。「音声認識を許可」をONにすると、音声をダウンロードしてWhisperで文字起こしします（数分かかります）"
-        else:
-            msg = "字幕を取得できませんでした。「音声認識を許可」をONにしてください"
-        return {"title": title, "text": None, "lang": "", "error": msg, "needs_whisper": True}
-
-    logger.info("[Step3:Whisper] %s: 字幕取得不可のため音声文字起こしに切替", video_id)
+    # --- Step 3: yt-dlp 音声 + Whisper（自動フォールバック） ---
+    logger.info("[Step3:Whisper] %s: 字幕取得不可 → 音声認識にフォールバック", video_id)
     yt_url = f"https://www.youtube.com/watch?v={video_id}"
     tr = transcribe_audio(yt_url, tmp_dir)
     if tr["text"]:
@@ -958,7 +947,7 @@ async def websocket_endpoint(websocket: WebSocket):
             elif action == "transcribe_selected":
                 items = data.get("items", [])
                 save_dir = data.get("save_dir", "").strip()
-                allow_whisper = data.get("allow_whisper", False)
+
                 if not items:
                     await websocket.send_json({"type": "error", "message": "文字起こしする項目を選択してください"})
                     continue
@@ -979,7 +968,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         await asyncio.sleep(2.0)
                     batch_num = i // BATCH_SIZE + 1
                     batch_label = f"[{batch_num}/{batch_count}] " if batch_count > 1 else ""
-                    progress_msg = f"{batch_label}{i+1}/{total}件 処理中..."
+                    progress_msg = f"{batch_label}{i+1}/{total}件 処理中...（字幕取得不可の場合は音声認識で数分かかります）"
                     await websocket.send_json({"type": "progress", "current": i+1, "total": total, "message": progress_msg})
                     vid = item.get("video_id", "")
                     title = item.get("title", "不明")
@@ -991,7 +980,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 result = {"index": i, "type": "youtube", "title": title, "url": "", "lang": "", "lang_ja": "", "text": None, "error": "不正な動画IDです"}
                             else:
                                 yt_url = f"https://www.youtube.com/watch?v={vid}"
-                                tr = await run_with_timeout(partial(get_youtube_transcript, vid, tmp_dir=tmp_dir, allow_whisper=allow_whisper))
+                                tr = await run_with_timeout(partial(get_youtube_transcript, vid, tmp_dir=tmp_dir))
                                 result = {
                                     "index": i, "type": "youtube",
                                     "title": tr["title"], "url": yt_url,
@@ -1122,7 +1111,7 @@ async def websocket_endpoint(websocket: WebSocket):
             elif action == "transcribe_url":
                 urls = data.get("urls", [])
                 save_dir = data.get("save_dir", "").strip()
-                allow_whisper = data.get("allow_whisper", False)
+
                 valid, err = validate_save_dir(save_dir)
                 if not valid:
                     await websocket.send_json({"type": "error", "message": err})
@@ -1154,11 +1143,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 for i, item in enumerate(items):
                     if i > 0 and item["type"] == "youtube":
                         await asyncio.sleep(2.0)
-                    await websocket.send_json({"type": "progress", "current": i+1, "total": total, "message": f"{i+1}/{total}件 処理中..."})
+                    await websocket.send_json({"type": "progress", "current": i+1, "total": total, "message": f"{i+1}/{total}件 処理中...（字幕取得不可の場合は音声認識で数分かかります）"})
                     result = None
                     try:
                         if item["type"] == "youtube":
-                            tr = await run_with_timeout(partial(get_youtube_transcript, item["video_id"], tmp_dir=tmp_dir, allow_whisper=allow_whisper))
+                            tr = await run_with_timeout(partial(get_youtube_transcript, item["video_id"], tmp_dir=tmp_dir))
                             result = {
                                 "index": i, "type": "youtube",
                                 "title": tr["title"], "url": item["url"],
@@ -1205,7 +1194,7 @@ async def websocket_endpoint(websocket: WebSocket):
             elif action == "analyze":
                 url = data.get("url", "").strip()
                 save_dir = data.get("save_dir", "").strip()
-                allow_whisper = data.get("allow_whisper", False)
+
 
                 url_valid, url_err = validate_url(url)
                 if not url_valid:
@@ -1256,7 +1245,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         await asyncio.sleep(2.0)
                     batch_num = i // BATCH_SIZE + 1
                     batch_label = f"[{batch_num}/{batch_count}] " if batch_count > 1 else ""
-                    progress_msg = f"{batch_label}{i+1}/{total}件 処理中..."
+                    progress_msg = f"{batch_label}{i+1}/{total}件 処理中...（字幕取得不可の場合は音声認識で数分かかります）"
                     await websocket.send_json({"type": "progress", "current": i+1, "total": total, "message": progress_msg})
 
                     result = None
@@ -1264,7 +1253,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         if item["type"] == "youtube":
                             vid = item["video_id"]
                             yt_url = f"https://www.youtube.com/watch?v={vid}"
-                            tr = await run_with_timeout(partial(get_youtube_transcript, vid, tmp_dir=tmp_dir, allow_whisper=allow_whisper))
+                            tr = await run_with_timeout(partial(get_youtube_transcript, vid, tmp_dir=tmp_dir))
                             result = {
                                 "index": i, "type": "youtube",
                                 "title": tr["title"], "url": yt_url,
