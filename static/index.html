@@ -862,6 +862,13 @@
         }
 
         function stopRecording() {
+            // 即座にUIを停止状態にする
+            if (recordingTimer) { clearInterval(recordingTimer); recordingTimer = null; }
+            document.getElementById('recordStopBtn').disabled = true;
+            document.getElementById('recordStopBtn').textContent = '停止中...';
+            document.getElementById('recordingMsg').textContent = '停止処理中...（残りの文字起こしを完了しています）';
+            document.getElementById('recordingDot').style.animation = 'none';
+            document.getElementById('recordingDot').style.background = '#888';
             if (recordWs && recordWs.readyState === WebSocket.OPEN) {
                 recordWs.send(JSON.stringify({ action: 'stop_recording' }));
             }
@@ -870,7 +877,11 @@
         function resetRecordingUI() {
             document.getElementById('recordStartBtn').style.display = 'inline-block';
             document.getElementById('recordStopBtn').style.display = 'none';
+            document.getElementById('recordStopBtn').disabled = false;
+            document.getElementById('recordStopBtn').textContent = '録音停止';
             document.getElementById('recordingStatus').style.display = 'none';
+            document.getElementById('recordingDot').style.animation = 'blink 1s infinite';
+            document.getElementById('recordingDot').style.background = '#e94560';
             if (recordingTimer) { clearInterval(recordingTimer); recordingTimer = null; }
         }
 
