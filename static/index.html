@@ -231,6 +231,7 @@
             <button class="tab active" onclick="switchTab('url')">URL解析</button>
             <button class="tab" onclick="switchTab('search')">キーワード検索</button>
             <button class="tab" onclick="switchTab('folder')">フォルダ指定</button>
+            <button class="tab" onclick="switchTab('record')">デスクトップ録音</button>
         </div>
 
         <!-- URL解析タブ -->
@@ -337,6 +338,41 @@
             </div>
         </div>
 
+        <!-- デスクトップ録音タブ -->
+        <div class="tab-content" id="tab-record">
+            <div class="input-section">
+                <div class="input-group">
+                    <label>PC上で再生中の音声を録音して文字起こしします</label>
+                    <div style="display:flex;gap:10px;margin-top:10px">
+                        <button class="btn btn-primary" id="recordStartBtn" onclick="startRecording()">録音開始</button>
+                        <button class="btn btn-danger" id="recordStopBtn" onclick="stopRecording()" style="display:none">録音停止</button>
+                    </div>
+                </div>
+                <div class="input-group">
+                    <label>保存先フォルダ（任意）</label>
+                    <input type="text" id="recordSaveDirInput" placeholder="C:\Users\Owner\Documents\transcripts">
+                </div>
+            </div>
+            <div id="recordingStatus" style="display:none;background:#16213e;border-radius:12px;padding:16px 24px;margin-bottom:20px">
+                <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
+                    <span id="recordingDot" style="width:12px;height:12px;border-radius:50%;background:#e94560;animation:blink 1s infinite"></span>
+                    <span id="recordingTime" style="font-size:1.1rem;font-weight:600">0:00</span>
+                    <span id="recordingMsg" style="color:#aaa;font-size:0.85rem">録音中...</span>
+                </div>
+            </div>
+            <div id="recordingText" style="display:none;background:#16213e;border-radius:12px;padding:20px;margin-bottom:20px">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+                    <span style="font-weight:600;font-size:0.95rem">文字起こし結果</span>
+                    <button class="btn btn-download btn-sm" onclick="downloadRecordingText()">TXTで保存</button>
+                </div>
+                <div id="recordingTextContent" style="background:#0f3460;border-radius:8px;padding:16px;font-size:0.9rem;line-height:1.8;white-space:pre-wrap;word-break:break-word;max-height:500px;overflow-y:auto"></div>
+            </div>
+        </div>
+
+        <style>
+            @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
+        </style>
+
         <div class="status-message" id="statusMsg"></div>
 
         <div class="progress-bar" id="progressBar">
@@ -403,12 +439,13 @@
         }
 
         function switchTab(tab) {
-            const tabs = ['url', 'search', 'folder'];
+            const tabs = ['url', 'search', 'folder', 'record'];
             document.querySelectorAll('.tab').forEach((t, i) => {
                 t.classList.toggle('active', tab === tabs[i]);
             });
             tabs.forEach(t => {
-                document.getElementById('tab-' + t).classList.toggle('active', tab === t);
+                const el = document.getElementById('tab-' + t);
+                if (el) el.classList.toggle('active', tab === t);
             });
         }
 
@@ -786,6 +823,100 @@
             a.href = URL.createObjectURL(blob);
             const ds = `${now.getFullYear()}${String(now.getMonth()+1).padStart(2,'0')}${String(now.getDate()).padStart(2,'0')}`;
             a.download = `文字起こし_${ds}.txt`;
+            a.click();
+            URL.revokeObjectURL(a.href);
+        }
+
+        // ===== デスクトップ録音 =====
+        let recordWs = null;
+        let recordingTimer = null;
+        let recordingSeconds = 0;
+        let recordingTexts = [];
+
+        async function startRecording() {
+            const saveDir = document.getElementById('recordSaveDirInput').value.trim();
+            hideStatus();
+            recordingTexts = [];
+            recordingSeconds = 0;
+            document.getElementById('recordingTextContent').textContent = '';
+            document.getElementById('recordingText').style.display = 'none';
+            document.getElementById('recordStartBtn').style.display = 'none';
+            document.getElementById('recordStopBtn').style.display = 'inline-block';
+            document.getElementById('recordingStatus').style.display = 'block';
+            document.getElementById('recordingTime').textContent = '0:00';
+            document.getElementById('recordingMsg').textContent = '録音開始中...';
+
+            recordingTimer = setInterval(() => {
+                recordingSeconds++;
+                const m = Math.floor(recordingSeconds / 60);
+                const s = recordingSeconds % 60;
+                document.getElementById('recordingTime').textContent = `${m}:${String(s).padStart(2,'0')}`;
+            }, 1000);
+
+            try {
+                recordWs = await getWs();
+            } catch { resetRecordingUI(); return; }
+            recordWs.onmessage = (event) => handleRecordingMessage(JSON.parse(event.data));
+            recordWs.onclose = () => resetRecordingUI();
+            recordWs.send(JSON.stringify({ action: 'start_recording', save_dir: saveDir }));
+        }
+
+        function stopRecording() {
+            if (recordWs && recordWs.readyState === WebSocket.OPEN) {
+                recordWs.send(JSON.stringify({ action: 'stop_recording' }));
+            }
+        }
+
+        function resetRecordingUI() {
+            document.getElementById('recordStartBtn').style.display = 'inline-block';
+            document.getElementById('recordStopBtn').style.display = 'none';
+            document.getElementById('recordingStatus').style.display = 'none';
+            if (recordingTimer) { clearInterval(recordingTimer); recordingTimer = null; }
+        }
+
+        function handleRecordingMessage(msg) {
+            switch (msg.type) {
+                case 'recording_started':
+                    document.getElementById('recordingMsg').textContent = msg.message;
+                    break;
+                case 'recording_progress':
+                    document.getElementById('recordingMsg').textContent = msg.message;
+                    break;
+                case 'recording_text':
+                    recordingTexts.push(msg.text);
+                    document.getElementById('recordingText').style.display = 'block';
+                    document.getElementById('recordingTextContent').textContent = recordingTexts.join('\n');
+                    // 自動スクロール
+                    const el = document.getElementById('recordingTextContent');
+                    el.scrollTop = el.scrollHeight;
+                    break;
+                case 'recording_complete':
+                    resetRecordingUI();
+                    if (msg.text) {
+                        document.getElementById('recordingText').style.display = 'block';
+                        document.getElementById('recordingTextContent').textContent = msg.text;
+                    }
+                    let completeMsg = `録音完了: ${msg.total_seconds}秒`;
+                    if (msg.saved_path) completeMsg += ` | 保存: ${msg.saved_path}`;
+                    showStatus(completeMsg, 'success');
+                    break;
+                case 'error':
+                    resetRecordingUI();
+                    showStatus(msg.message, 'error');
+                    break;
+            }
+        }
+
+        function downloadRecordingText() {
+            const text = document.getElementById('recordingTextContent').textContent;
+            if (!text) { showStatus('テキストがありません', 'error'); return; }
+            const now = new Date();
+            const ds = `${now.getFullYear()}${String(now.getMonth()+1).padStart(2,'0')}${String(now.getDate()).padStart(2,'0')}_${String(now.getHours()).padStart(2,'0')}${String(now.getMinutes()).padStart(2,'0')}`;
+            const header = `デスクトップ録音 文字起こし\n録音日時: ${now.toLocaleString('ja-JP')}\n${'='.repeat(50)}\n\n`;
+            const blob = new Blob([header + text], { type: 'text/plain;charset=utf-8' });
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = `録音文字起こし_${ds}.txt`;
             a.click();
             URL.revokeObjectURL(a.href);
         }

@@ -1511,6 +1511,193 @@ async def websocket_endpoint(websocket: WebSocket):
                     summary["save_dir"] = save_dir
                 await websocket.send_json(summary)
 
+            elif action == "start_recording":
+                save_dir = data.get("save_dir", "").strip()
+                if save_dir:
+                    valid, err = validate_save_dir(save_dir)
+                    if not valid:
+                        await websocket.send_json({"type": "error", "message": err})
+                        continue
+
+                # デスクトップ音声録音 + リアルタイム文字起こし
+                try:
+                    import pyaudiowpatch as pyaudio
+                    import wave
+                    import numpy as np
+                except ImportError:
+                    await websocket.send_json({"type": "error", "message": "pyaudiowpatch がインストールされていません。pip install PyAudioWPatch numpy を実行してください"})
+                    continue
+
+                try:
+                    pa = pyaudio.PyAudio()
+                    wasapi = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
+                    lb_device = None
+                    for idx in range(pa.get_device_count()):
+                        d = pa.get_device_info_by_index(idx)
+                        if d.get('isLoopbackDevice') and d['hostApi'] == wasapi['index']:
+                            lb_device = d
+                            break
+                    if not lb_device:
+                        pa.terminate()
+                        await websocket.send_json({"type": "error", "message": "ループバック録音デバイスが見つかりません"})
+                        continue
+
+                    sample_rate = int(lb_device['defaultSampleRate'])
+                    channels = lb_device['maxInputChannels']
+                    await websocket.send_json({"type": "recording_started", "message": f"録音開始（{sample_rate}Hz, {channels}ch）"})
+
+                    # 録音バッファ
+                    audio_buffer = []
+                    recording = {"active": True}
+                    all_texts = []
+                    chunk_sec = 10  # 10秒ごとに文字起こし
+
+                    def audio_callback(in_data, frame_count, time_info, status):
+                        if recording["active"]:
+                            audio_buffer.append(in_data)
+                        return (in_data, pyaudio.paContinue)
+
+                    stream = pa.open(
+                        format=pyaudio.paInt16, channels=channels, rate=sample_rate,
+                        input=True, input_device_index=lb_device['index'],
+                        frames_per_buffer=1024, stream_callback=audio_callback
+                    )
+                    stream.start_stream()
+
+                    chunk_frames = int(sample_rate / 1024 * chunk_sec)
+                    chunk_index = 0
+                    total_seconds = 0
+                    tmp_dir = os.path.join(os.path.dirname(__file__), "tmp_audio")
+                    os.makedirs(tmp_dir, exist_ok=True)
+
+                    loop = asyncio.get_event_loop()
+
+                    try:
+                        while recording["active"]:
+                            # stopメッセージを非ブロッキングでチェック
+                            try:
+                                msg = await asyncio.wait_for(websocket.receive_json(), timeout=1.0)
+                                if msg.get("action") == "stop_recording":
+                                    recording["active"] = False
+                                    break
+                            except asyncio.TimeoutError:
+                                pass
+
+                            # バッファが十分溜まったら文字起こし
+                            if len(audio_buffer) >= chunk_frames:
+                                chunk_data = b''.join(audio_buffer[:chunk_frames])
+                                del audio_buffer[:chunk_frames]
+                                chunk_index += 1
+                                total_seconds += chunk_sec
+
+                                # 無音チェック
+                                audio_array = np.frombuffer(chunk_data, dtype=np.int16)
+                                rms = np.sqrt(np.mean(audio_array.astype(float) ** 2))
+                                if rms < 50:
+                                    await websocket.send_json({
+                                        "type": "recording_progress",
+                                        "elapsed": total_seconds,
+                                        "message": f"録音中... {total_seconds}秒（無音）"
+                                    })
+                                    continue
+
+                                # WAVに保存して文字起こし
+                                chunk_path = os.path.join(tmp_dir, f"rec_chunk_{chunk_index}.wav")
+                                with wave.open(chunk_path, 'wb') as wf:
+                                    wf.setnchannels(channels)
+                                    wf.setsampwidth(2)
+                                    wf.setframerate(sample_rate)
+                                    wf.writeframes(chunk_data)
+
+                                await websocket.send_json({
+                                    "type": "recording_progress",
+                                    "elapsed": total_seconds,
+                                    "message": f"録音中... {total_seconds}秒 → 文字起こし中..."
+                                })
+
+                                def transcribe_chunk(path):
+                                    try:
+                                        from faster_whisper import WhisperModel
+                                        model = WhisperModel("base", device="cpu", compute_type="int8")
+                                        segments, info = model.transcribe(path, beam_size=5)
+                                        text = " ".join(seg.text for seg in segments).strip()
+                                        return {"text": text, "lang": info.language}
+                                    except Exception as e:
+                                        logger.warning("Chunk transcribe error: %s", e)
+                                        return {"text": "", "lang": ""}
+                                    finally:
+                                        try:
+                                            os.remove(path)
+                                        except OSError:
+                                            pass
+
+                                tr = await loop.run_in_executor(None, transcribe_chunk, chunk_path)
+                                if tr["text"]:
+                                    all_texts.append(tr["text"])
+                                    await websocket.send_json({
+                                        "type": "recording_text",
+                                        "chunk_index": chunk_index,
+                                        "text": tr["text"],
+                                        "lang": tr["lang"],
+                                        "elapsed": total_seconds,
+                                    })
+
+                    finally:
+                        recording["active"] = False
+                        stream.stop_stream()
+                        stream.close()
+                        pa.terminate()
+
+                    # 残りバッファを処理
+                    if audio_buffer:
+                        remaining = b''.join(audio_buffer)
+                        audio_array = np.frombuffer(remaining, dtype=np.int16)
+                        rms = np.sqrt(np.mean(audio_array.astype(float) ** 2))
+                        if rms >= 50:
+                            chunk_path = os.path.join(tmp_dir, f"rec_chunk_final.wav")
+                            with wave.open(chunk_path, 'wb') as wf:
+                                wf.setnchannels(channels)
+                                wf.setsampwidth(2)
+                                wf.setframerate(sample_rate)
+                                wf.writeframes(remaining)
+                            tr = await loop.run_in_executor(None, transcribe_chunk, chunk_path)
+                            if tr["text"]:
+                                all_texts.append(tr["text"])
+                                await websocket.send_json({
+                                    "type": "recording_text",
+                                    "chunk_index": chunk_index + 1,
+                                    "text": tr["text"],
+                                    "lang": tr.get("lang", ""),
+                                    "elapsed": total_seconds,
+                                })
+
+                    # 結果をファイル保存
+                    combined_text = "\n".join(all_texts)
+                    saved_path = ""
+                    if combined_text and save_dir:
+                        try:
+                            now = datetime.datetime.now()
+                            filename = f"録音文字起こし_{now.strftime('%Y%m%d_%H%M%S')}.txt"
+                            saved_path = os.path.join(os.path.normpath(save_dir), filename)
+                            os.makedirs(os.path.dirname(saved_path), exist_ok=True)
+                            header = f"デスクトップ録音 文字起こし\n録音日時: {now.strftime('%Y/%m/%d %H:%M:%S')}\n録音時間: {total_seconds}秒\n{'='*50}\n\n"
+                            with open(saved_path, "w", encoding="utf-8") as f:
+                                f.write(header + combined_text)
+                        except Exception as e:
+                            logger.warning("Save error: %s", e)
+
+                    await websocket.send_json({
+                        "type": "recording_complete",
+                        "total_seconds": total_seconds,
+                        "chunks": chunk_index,
+                        "text": combined_text,
+                        "saved_path": saved_path,
+                    })
+
+                except Exception as e:
+                    logger.error("Recording error: %s", e)
+                    await websocket.send_json({"type": "error", "message": f"録音エラー: {str(e)[:200]}"})
+
     except WebSocketDisconnect:
         pass
     except Exception as e:
