@@ -1252,22 +1252,51 @@ async def websocket_endpoint(websocket: WebSocket):
                 if not urls or not isinstance(urls, list):
                     await websocket.send_json({"type": "error", "message": "URLが指定されていません"})
                     continue
-                # 各URLをYouTube動画IDまたはメディアURLとして分類
+                # 各URLを分類: YouTube → 直接処理、その他 → ページ解析で埋め込みコンテンツ検出
                 items = []
+                media_exts = ('.mp3', '.m4a', '.wav', '.ogg', '.flac', '.aac', '.opus',
+                              '.mp4', '.webm', '.mkv', '.avi', '.mov', '.wmv', '.m4v')
                 for u in urls:
                     u = u.strip()
                     if not u:
                         continue
-                    vid = None
+                    url_valid, url_err = validate_url(u)
+                    if not url_valid:
+                        continue
+                    # YouTube URL
                     m = re.search(r'(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/|youtube\.com/v/)([a-zA-Z0-9_-]{11})', u)
                     if m:
-                        vid = m.group(1)
-                    if vid:
-                        items.append({"type": "youtube", "video_id": vid, "title": "", "url": u})
+                        items.append({"type": "youtube", "video_id": m.group(1), "title": "", "url": u})
+                    # 直接メディアファイルURL
+                    elif any(urlparse(u).path.lower().endswith(ext) for ext in media_exts):
+                        items.append({"type": "media", "url": u, "title": os.path.basename(urlparse(u).path).rsplit('.', 1)[0] or "media"})
+                    # その他のWebページ → Playwrightで解析
                     else:
-                        items.append({"type": "media", "url": u, "title": os.path.basename(urlparse(u).path) or "media"})
+                        await websocket.send_json({"type": "step", "index": -1, "message": f"ページを解析中: {u[:60]}..."})
+                        try:
+                            async with async_playwright() as p:
+                                browser = await p.chromium.launch(headless=True)
+                                page = await browser.new_page()
+                                await page.goto(u, wait_until="networkidle", timeout=60000)
+                                await page.wait_for_timeout(3000)
+                                html = await page.content()
+                                await browser.close()
+                            yt_items = extract_youtube_ids(html, u)
+                            audio_items = extract_audio_urls(html, u)
+                            video_items = extract_video_urls(html, u)
+                            found = yt_items + video_items + audio_items
+                            if found:
+                                items.extend(found)
+                                await websocket.send_json({"type": "step", "index": -1, "message": f"{u[:40]}... → {len(found)}件のコンテンツを検出"})
+                            else:
+                                # ページ内にコンテンツが見つからない場合、yt-dlpで直接試す
+                                items.append({"type": "media", "url": u, "title": os.path.basename(urlparse(u).path) or urlparse(u).netloc})
+                        except Exception as e:
+                            logger.warning("Page analysis error for %s: %s", u, e)
+                            # 解析失敗時もyt-dlpで直接試す
+                            items.append({"type": "media", "url": u, "title": os.path.basename(urlparse(u).path) or urlparse(u).netloc})
                 if not items:
-                    await websocket.send_json({"type": "error", "message": "有効なURLがありませ���"})
+                    await websocket.send_json({"type": "error", "message": "有効なURLがありません"})
                     continue
                 total = len(items)
                 results = []
