@@ -907,46 +907,66 @@ async def run_with_timeout(func, *args, timeout=PER_ITEM_TIMEOUT):
 
 
 async def transcribe_youtube_with_progress(video_id, tmp_dir, websocket, item_index, cancel_flag):
-    """YouTube文字起こしを進捗付きで実行する。各ステップの状態をWebSocketで送信。"""
+    """YouTube文字起こしを進捗付きで実行。ハートビートで接続を維持。"""
     loop = asyncio.get_event_loop()
 
-    async def send_step(msg):
+    async def send_step(msg, pct=0):
+        """ステップ進捗をWebSocketで送信"""
         try:
-            await websocket.send_json({"type": "step", "index": item_index, "message": msg})
+            await websocket.send_json({"type": "step", "index": item_index, "message": msg, "pct": pct})
         except Exception:
             pass
+
+    async def run_with_heartbeat(executor_func, step_msg, pct_start, pct_end):
+        """バックグラウンド処理中に5秒ごとにハートビートを送信"""
+        future = loop.run_in_executor(None, executor_func)
+        elapsed = 0
+        while not future.done():
+            try:
+                return await asyncio.wait_for(asyncio.shield(future), timeout=5)
+            except asyncio.TimeoutError:
+                elapsed += 5
+                m, s = divmod(elapsed, 60)
+                pct = min(pct_start + (pct_end - pct_start) * min(elapsed / 600, 0.95), pct_end - 1)
+                await send_step(f"{step_msg}（{m}分{s:02d}秒経過）", int(pct))
+                if cancel_flag.get("cancelled"):
+                    future.cancel()
+                    raise asyncio.CancelledError()
+        return future.result()
 
     if not validate_youtube_id(video_id):
         return {"title": f"YouTube_{video_id[:20]}", "text": None, "lang": "", "error": "不正な動画IDです"}
 
-    await send_step("動画情報を取得中...")
+    # 5%: 動画情報取得
+    await send_step("動画情報を取得中...", 5)
     title = await loop.run_in_executor(None, get_youtube_title, video_id)
 
     if cancel_flag.get("cancelled"):
         return {"title": title, "text": None, "lang": "", "error": "処理が中止されました"}
 
-    # Step 1
-    await send_step("字幕APIで取得中...")
+    # 10%: Step 1 字幕API
+    await send_step("字幕APIで取得中...", 10)
     result = await loop.run_in_executor(None, _try_subtitle_api, video_id)
     if result and "ip_blocked" not in result:
+        await send_step("字幕取得完了", 100)
         return {"title": title, "text": result["text"], "lang": result["lang"],
                 "error": None, "source": result["source"]}
 
     if cancel_flag.get("cancelled"):
         return {"title": title, "text": None, "lang": "", "error": "処理が中止されました"}
 
-    # Step 2
-    await send_step("yt-dlpで字幕取得中...")
+    # 15%: Step 2 yt-dlp字幕
+    await send_step("yt-dlpで字幕取得中...", 15)
     result = await loop.run_in_executor(None, _try_yt_dlp_subtitles, video_id, tmp_dir)
     if result:
+        await send_step("字幕取得完了", 100)
         return {"title": title, "text": result["text"], "lang": result["lang"],
                 "error": None, "source": result["source"]}
 
     if cancel_flag.get("cancelled"):
         return {"title": title, "text": None, "lang": "", "error": "処理が中止されました"}
 
-    # Step 3: 音声DL
-    await send_step("字幕取得不可 → 音声をダウンロード中...（1〜3分）")
+    # 20-50%: Step 3a 音声ダウンロード
     import subprocess
     os.makedirs(tmp_dir, exist_ok=True)
     out_template = os.path.join(tmp_dir, "%(title)s.%(ext)s")
@@ -959,12 +979,11 @@ async def transcribe_youtube_with_progress(video_id, tmp_dir, websocket, item_in
         return subprocess.run(cmd, capture_output=True, timeout=300)
 
     try:
-        dl_result = await asyncio.wait_for(loop.run_in_executor(None, download_audio), timeout=360)
-    except (asyncio.TimeoutError, subprocess.TimeoutExpired):
-        return {"title": title, "text": None, "lang": "", "error": "音声ダウンロードがタイムアウトしました（5分超過）"}
-
-    if cancel_flag.get("cancelled"):
+        dl_result = await run_with_heartbeat(download_audio, "音声をダウンロード中", 20, 50)
+    except asyncio.CancelledError:
         return {"title": title, "text": None, "lang": "", "error": "処理が中止されました"}
+    except Exception:
+        return {"title": title, "text": None, "lang": "", "error": "音声ダウンロードに失敗しました"}
 
     # ファイルパス取得（エンコーディング対応）
     filepath = ""
@@ -983,9 +1002,9 @@ async def transcribe_youtube_with_progress(video_id, tmp_dir, websocket, item_in
             return {"title": title, "text": None, "lang": "", "error": "ダウンロード失敗: 音声ファイルを取得できませんでした"}
 
     file_size = os.path.getsize(filepath)
-    await send_step(f"音声DL完了（{format_file_size(file_size)}）→ Whisperで文字起こし中...（数分かかります）")
+    await send_step(f"音声DL完了（{format_file_size(file_size)}）→ Whisperで文字起こし中...", 50)
 
-    # Step 3b: Whisper文字起こし
+    # 50-95%: Step 3b Whisper文字起こし（ハートビート付き）
     try:
         def run_whisper():
             from faster_whisper import WhisperModel
@@ -994,10 +1013,11 @@ async def transcribe_youtube_with_progress(video_id, tmp_dir, websocket, item_in
             text = " ".join(seg.text for seg in segments)
             return {"text": text.strip(), "lang": info.language, "error": None, "source": "Whisper音声認識"}
 
-        tr = await asyncio.wait_for(loop.run_in_executor(None, run_whisper), timeout=PER_ITEM_TIMEOUT)
+        tr = await run_with_heartbeat(run_whisper, "Whisperで文字起こし中", 50, 95)
+        await send_step("文字起こし完了", 100)
         return {"title": title, **tr}
-    except asyncio.TimeoutError:
-        return {"title": title, "text": None, "lang": "", "error": f"Whisper文字起こしがタイムアウトしました（{PER_ITEM_TIMEOUT}秒超過）"}
+    except asyncio.CancelledError:
+        return {"title": title, "text": None, "lang": "", "error": "処理が中止されました"}
     except Exception as e:
         logger.warning("Whisper error: %s", e)
         return {"title": title, "text": None, "lang": "", "error": "文字起こしエラー: Whisper処理に失敗しました"}

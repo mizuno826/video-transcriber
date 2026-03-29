@@ -422,20 +422,9 @@
             document.getElementById('statusMsg').style.display = 'none';
         }
 
-        let wsActivityTimer = null;
-        const WS_INACTIVITY_TIMEOUT = 1860000; // 31分（サーバー側30分+余裕）
-
-        function resetWsTimer() {
-            if (wsActivityTimer) clearTimeout(wsActivityTimer);
-            wsActivityTimer = setTimeout(() => {
-                showStatus('サーバーからの応答がタイムアウトしました。処理を中断します。', 'error');
-                if (ws) { try { ws.close(); } catch(e) {} }
-                resetUI();
-            }, WS_INACTIVITY_TIMEOUT);
-        }
-        function clearWsTimer() {
-            if (wsActivityTimer) { clearTimeout(wsActivityTimer); wsActivityTimer = null; }
-        }
+        // タイムアウトなし — ハートビートで接続維持
+        function resetWsTimer() {}
+        function clearWsTimer() {}
 
         function getWs() {
             return new Promise((resolve, reject) => {
@@ -653,6 +642,10 @@
                 case 'step':
                     document.getElementById('stepText').style.display = 'block';
                     document.getElementById('stepText').textContent = msg.message;
+                    if (msg.pct !== undefined && msg.pct > 0) {
+                        document.getElementById('progressFill').style.width = msg.pct + '%';
+                        document.getElementById('progressPct').textContent = msg.pct + '%';
+                    }
                     break;
                 case 'result':
                     document.querySelector('.progress-track').classList.remove('pulse');
