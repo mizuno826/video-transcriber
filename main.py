@@ -1066,6 +1066,21 @@ async def index():
     return FileResponse("static/index.html")
 
 
+@app.get("/api/download-recording")
+async def download_recording(path: str):
+    """録音WAVファイルをダウンロードする"""
+    path = os.path.normpath(path)
+    # セキュリティ: tmp_audioまたはvalidate_pathで検証
+    valid, err = validate_path(path)
+    if not valid:
+        return Response(content=err, status_code=400)
+    if not os.path.isfile(path):
+        return Response(content="ファイルが見つかりません", status_code=404)
+    filename = os.path.basename(path)
+    from starlette.responses import FileResponse as FR
+    return FR(path, filename=filename, media_type="audio/wav")
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     global active_ws_connections

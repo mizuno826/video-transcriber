@@ -363,7 +363,10 @@
             <div id="recordingText" style="display:none;background:#16213e;border-radius:12px;padding:20px;margin-bottom:20px">
                 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
                     <span style="font-weight:600;font-size:0.95rem">文字起こし結果</span>
-                    <button class="btn btn-download btn-sm" onclick="downloadRecordingText()">TXTで保存</button>
+                    <div style="display:flex;gap:8px">
+                        <button class="btn btn-download btn-sm" id="downloadWavBtn" onclick="downloadRecordingWav()" style="display:none">録音を保存</button>
+                        <button class="btn btn-download btn-sm" onclick="downloadRecordingText()">TXTで保存</button>
+                    </div>
                 </div>
                 <div id="recordingTextContent" style="background:#0f3460;border-radius:8px;padding:16px;font-size:0.9rem;line-height:1.8;white-space:pre-wrap;word-break:break-word;max-height:500px;overflow-y:auto"></div>
             </div>
@@ -832,6 +835,7 @@
         let recordingTimer = null;
         let recordingSeconds = 0;
         let recordingTexts = [];
+        let lastWavPath = "";
 
         async function startRecording() {
             const saveDir = document.getElementById('recordSaveDirInput').value.trim();
@@ -907,6 +911,10 @@
                         document.getElementById('recordingText').style.display = 'block';
                         document.getElementById('recordingTextContent').textContent = msg.text;
                     }
+                    lastWavPath = msg.wav_path || "";
+                    if (lastWavPath) {
+                        document.getElementById('downloadWavBtn').style.display = 'inline-block';
+                    }
                     let recMsg = `録音完了: ${msg.total_seconds}秒`;
                     if (msg.wav_path) recMsg += ` | WAV: ${msg.wav_path}`;
                     if (msg.saved_path) recMsg += ` | TXT: ${msg.saved_path}`;
@@ -917,6 +925,11 @@
                     showStatus(msg.message, 'error');
                     break;
             }
+        }
+
+        function downloadRecordingWav() {
+            if (!lastWavPath) { showStatus('録音ファイルがありません', 'error'); return; }
+            window.location.href = '/api/download-recording?path=' + encodeURIComponent(lastWavPath);
         }
 
         function downloadRecordingText() {
