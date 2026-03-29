@@ -492,6 +492,7 @@ def _try_yt_dlp_subtitles(video_id: str, tmp_dir: str) -> dict | None:
         "--sub-format", "json3",
         "--no-abort-on-error",
         "--socket-timeout", "15",
+        "--js-runtimes", "node",
     ]
     base_cmd += _get_cookies_args()
     base_cmd += ["-o", out_path, yt_url]
@@ -763,7 +764,7 @@ def transcribe_audio(url: str, tmp_dir: str) -> dict:
     out_template = os.path.join(tmp_dir, "%(title)s.%(ext)s")
     try:
         cmd = ["yt-dlp", "--no-playlist", "-x", "--audio-format", "wav",
-               "--socket-timeout", "30"]
+               "--socket-timeout", "30", "--js-runtimes", "node"]
         # 注意: cookies.txtは音声DLでは使わない（Cookie付きだとフォーマット取得が失敗するため）
         cmd += ["-o", out_template, "--print", "after_move:filepath", url]
         result = subprocess.run(cmd, capture_output=True, timeout=300)
@@ -786,12 +787,25 @@ def transcribe_audio(url: str, tmp_dir: str) -> dict:
                 if all_files:
                     filepath = os.path.join(tmp_dir, all_files[0])
                 else:
-                    return {"text": None, "lang": "", "error": "ダウンロード失敗: 音声ファイルを取得できませんでした"}
+                    # stderrからエラー詳細を取得
+                    stderr_text = ""
+                    for enc in ["utf-8", "cp932"]:
+                        try:
+                            stderr_text = result.stderr.decode(enc) if isinstance(result.stderr, bytes) else str(result.stderr)
+                            break
+                        except UnicodeDecodeError:
+                            continue
+                    error_lines = [l.strip() for l in stderr_text.split('\n') if 'ERROR' in l]
+                    error_detail = error_lines[-1][:200] if error_lines else ""
+                    msg = "ダウンロード失敗: 音声ファイルを取得できませんでした"
+                    if error_detail:
+                        msg += f"\n詳細: {error_detail}"
+                    return {"text": None, "lang": "", "error": msg}
     except subprocess.TimeoutExpired:
-        return {"text": None, "lang": "", "error": "ダウンロードエラー: タイムアウトしました（2分超過）"}
+        return {"text": None, "lang": "", "error": "ダウンロードエラー: タイムアウトしました（5分超過）"}
     except Exception as e:
         logger.warning("Audio download error: %s", e)
-        return {"text": None, "lang": "", "error": "ダウンロードエラー: 音声の取得に失敗しました"}
+        return {"text": None, "lang": "", "error": f"ダウンロードエラー: {str(e)[:200]}"}
 
     try:
         file_size = os.path.getsize(filepath)
@@ -974,7 +988,7 @@ async def transcribe_youtube_with_progress(video_id, tmp_dir, websocket, item_in
 
     def download_audio():
         cmd = ["yt-dlp", "--no-playlist", "-x", "--audio-format", "wav",
-               "--socket-timeout", "30",
+               "--socket-timeout", "30", "--js-runtimes", "node",
                "-o", out_template, "--print", "after_move:filepath", yt_url]
         return subprocess.run(cmd, capture_output=True, timeout=300)
 
@@ -982,8 +996,23 @@ async def transcribe_youtube_with_progress(video_id, tmp_dir, websocket, item_in
         dl_result = await run_with_heartbeat(download_audio, "音声をダウンロード中", 20, 50)
     except asyncio.CancelledError:
         return {"title": title, "text": None, "lang": "", "error": "処理が中止されました"}
-    except Exception:
-        return {"title": title, "text": None, "lang": "", "error": "音声ダウンロードに失敗しました"}
+    except Exception as e:
+        logger.warning("Audio download error for %s: %s", video_id, e)
+        return {"title": title, "text": None, "lang": "", "error": f"音声ダウンロードに失敗しました: {str(e)[:200]}"}
+
+    # DL結果のエラーチェック
+    if dl_result.returncode != 0:
+        stderr_text = ""
+        for enc in ["utf-8", "cp932"]:
+            try:
+                stderr_text = dl_result.stderr.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        error_lines = [l.strip() for l in stderr_text.split('\n') if 'ERROR' in l]
+        error_detail = error_lines[-1] if error_lines else "不明なエラー"
+        logger.warning("yt-dlp error for %s: %s", video_id, error_detail)
+        return {"title": title, "text": None, "lang": "", "error": f"音声ダウンロードエラー: {error_detail[:200]}"}
 
     # ファイルパス取得（エンコーディング対応）
     filepath = ""

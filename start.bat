@@ -1,6 +1,7 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
+set "PATH=%PATH%;C:\Program Files\nodejs"
 
 echo ========================================
 echo   動画文字起こしツール
