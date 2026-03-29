@@ -687,7 +687,7 @@ def transcribe_single_chunk(filepath: str) -> dict:
     try:
         from faster_whisper import WhisperModel
         model = WhisperModel("medium", device="cpu", compute_type="int8")
-        segments, info = model.transcribe(filepath, beam_size=5)
+        segments, info = model.transcribe(filepath, beam_size=5, vad_filter=True)
         text = " ".join(seg.text for seg in segments)
         return {"text": text.strip(), "lang": info.language, "error": None}
     except Exception as e:
@@ -704,7 +704,7 @@ def transcribe_local_file(filepath: str) -> dict:
         try:
             from faster_whisper import WhisperModel
             model = WhisperModel("medium", device="cpu", compute_type="int8")
-            segments, info = model.transcribe(filepath, beam_size=5)
+            segments, info = model.transcribe(filepath, beam_size=5, vad_filter=True)
             text = " ".join(seg.text for seg in segments)
             lang = info.language
             return {"text": text.strip(), "lang": lang, "error": None}
@@ -834,7 +834,7 @@ def transcribe_audio(url: str, tmp_dir: str) -> dict:
         else:
             from faster_whisper import WhisperModel
             model = WhisperModel("medium", device="cpu", compute_type="int8")
-            segments, info = model.transcribe(filepath, beam_size=5)
+            segments, info = model.transcribe(filepath, beam_size=5, vad_filter=True)
             text = " ".join(seg.text for seg in segments)
             return {"text": text.strip(), "lang": info.language, "error": None}
     except Exception as e:
@@ -1038,7 +1038,7 @@ async def transcribe_youtube_with_progress(video_id, tmp_dir, websocket, item_in
         def run_whisper():
             from faster_whisper import WhisperModel
             model = WhisperModel("medium", device="cpu", compute_type="int8")
-            segments, info = model.transcribe(filepath, beam_size=5)
+            segments, info = model.transcribe(filepath, beam_size=5, vad_filter=True)
             text = " ".join(seg.text for seg in segments)
             return {"text": text.strip(), "lang": info.language, "error": None, "source": "Whisper音声認識"}
 
@@ -1576,20 +1576,32 @@ async def websocket_endpoint(websocket: WebSocket):
                     loop = asyncio.get_event_loop()
 
                     def transcribe_chunk(path):
+                        converted = path.replace(".wav", "_16k.wav")
                         try:
+                            import subprocess as sp
+                            # 48kHz ステレオ → 16kHz モノラル に変換（Whisper最適）
+                            sp.run(
+                                ["ffmpeg", "-y", "-i", path, "-ar", "16000", "-ac", "1", converted],
+                                capture_output=True, timeout=30
+                            )
+                            target = converted if os.path.isfile(converted) else path
                             from faster_whisper import WhisperModel
                             model = WhisperModel("medium", device="cpu", compute_type="int8")
-                            segments, info = model.transcribe(path, beam_size=5)
+                            segments, info = model.transcribe(
+                                target, beam_size=5, language="ja",
+                                vad_filter=True,  # 無音区間を自動除去
+                            )
                             text = " ".join(seg.text for seg in segments).strip()
                             return {"text": text, "lang": info.language}
                         except Exception as e:
                             logger.warning("Chunk transcribe error: %s", e)
                             return {"text": "", "lang": ""}
                         finally:
-                            try:
-                                os.remove(path)
-                            except OSError:
-                                pass
+                            for f in [path, converted]:
+                                try:
+                                    os.remove(f)
+                                except OSError:
+                                    pass
 
                     try:
                         # 文字起こしタスクを並行実行するためのリスト
