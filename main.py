@@ -766,7 +766,7 @@ def transcribe_audio(url: str, tmp_dir: str) -> dict:
                "--socket-timeout", "30"]
         # 注意: cookies.txtは音声DLでは使わない（Cookie付きだとフォーマット取得が失敗するため）
         cmd += ["-o", out_template, "--print", "after_move:filepath", url]
-        result = subprocess.run(cmd, capture_output=True, timeout=120)
+        result = subprocess.run(cmd, capture_output=True, timeout=300)
         # Windows環境ではcp932で出力されるため、複数エンコーディングで試行
         stdout_raw = result.stdout
         filepath = ""
@@ -893,8 +893,8 @@ def search_youtube(query: str, max_results: int = 20) -> list[dict]:
         return []
 
 
-# 1件あたりの処理タイムアウト（秒）— Whisperフォールバック時は数分かかるため余裕を持つ
-PER_ITEM_TIMEOUT = 600
+# 1件あたりの処理タイムアウト（秒）— Whisper音声認識は長時間かかる場合がある
+PER_ITEM_TIMEOUT = 1800
 
 
 async def run_with_timeout(func, *args, timeout=PER_ITEM_TIMEOUT):
@@ -904,6 +904,108 @@ async def run_with_timeout(func, *args, timeout=PER_ITEM_TIMEOUT):
         loop.run_in_executor(None, func),
         timeout=timeout,
     )
+
+
+async def transcribe_youtube_with_progress(video_id, tmp_dir, websocket, item_index, cancel_flag):
+    """YouTube文字起こしを進捗付きで実行する。各ステップの状態をWebSocketで送信。"""
+    loop = asyncio.get_event_loop()
+
+    async def send_step(msg):
+        try:
+            await websocket.send_json({"type": "step", "index": item_index, "message": msg})
+        except Exception:
+            pass
+
+    if not validate_youtube_id(video_id):
+        return {"title": f"YouTube_{video_id[:20]}", "text": None, "lang": "", "error": "不正な動画IDです"}
+
+    await send_step("動画情報を取得中...")
+    title = await loop.run_in_executor(None, get_youtube_title, video_id)
+
+    if cancel_flag.get("cancelled"):
+        return {"title": title, "text": None, "lang": "", "error": "処理が中止されました"}
+
+    # Step 1
+    await send_step("字幕APIで取得中...")
+    result = await loop.run_in_executor(None, _try_subtitle_api, video_id)
+    if result and "ip_blocked" not in result:
+        return {"title": title, "text": result["text"], "lang": result["lang"],
+                "error": None, "source": result["source"]}
+
+    if cancel_flag.get("cancelled"):
+        return {"title": title, "text": None, "lang": "", "error": "処理が中止されました"}
+
+    # Step 2
+    await send_step("yt-dlpで字幕取得中...")
+    result = await loop.run_in_executor(None, _try_yt_dlp_subtitles, video_id, tmp_dir)
+    if result:
+        return {"title": title, "text": result["text"], "lang": result["lang"],
+                "error": None, "source": result["source"]}
+
+    if cancel_flag.get("cancelled"):
+        return {"title": title, "text": None, "lang": "", "error": "処理が中止されました"}
+
+    # Step 3: 音声DL
+    await send_step("字幕取得不可 → 音声をダウンロード中...（1〜3分）")
+    import subprocess
+    os.makedirs(tmp_dir, exist_ok=True)
+    out_template = os.path.join(tmp_dir, "%(title)s.%(ext)s")
+    yt_url = f"https://www.youtube.com/watch?v={video_id}"
+
+    def download_audio():
+        cmd = ["yt-dlp", "--no-playlist", "-x", "--audio-format", "wav",
+               "--socket-timeout", "30",
+               "-o", out_template, "--print", "after_move:filepath", yt_url]
+        return subprocess.run(cmd, capture_output=True, timeout=300)
+
+    try:
+        dl_result = await asyncio.wait_for(loop.run_in_executor(None, download_audio), timeout=360)
+    except (asyncio.TimeoutError, subprocess.TimeoutExpired):
+        return {"title": title, "text": None, "lang": "", "error": "音声ダウンロードがタイムアウトしました（5分超過）"}
+
+    if cancel_flag.get("cancelled"):
+        return {"title": title, "text": None, "lang": "", "error": "処理が中止されました"}
+
+    # ファイルパス取得（エンコーディング対応）
+    filepath = ""
+    for enc in ["utf-8", "cp932", "shift_jis"]:
+        try:
+            filepath = dl_result.stdout.decode(enc).strip().split('\n')[-1].strip()
+            if os.path.isfile(filepath):
+                break
+        except (UnicodeDecodeError, ValueError):
+            continue
+    if not os.path.isfile(filepath):
+        wavs = [f for f in os.listdir(tmp_dir) if f.endswith('.wav')]
+        if wavs:
+            filepath = os.path.join(tmp_dir, wavs[0])
+        else:
+            return {"title": title, "text": None, "lang": "", "error": "ダウンロード失敗: 音声ファイルを取得できませんでした"}
+
+    file_size = os.path.getsize(filepath)
+    await send_step(f"音声DL完了（{format_file_size(file_size)}）→ Whisperで文字起こし中...（数分かかります）")
+
+    # Step 3b: Whisper文字起こし
+    try:
+        def run_whisper():
+            from faster_whisper import WhisperModel
+            model = WhisperModel("base", device="cpu", compute_type="int8")
+            segments, info = model.transcribe(filepath, beam_size=5)
+            text = " ".join(seg.text for seg in segments)
+            return {"text": text.strip(), "lang": info.language, "error": None, "source": "Whisper音声認識"}
+
+        tr = await asyncio.wait_for(loop.run_in_executor(None, run_whisper), timeout=PER_ITEM_TIMEOUT)
+        return {"title": title, **tr}
+    except asyncio.TimeoutError:
+        return {"title": title, "text": None, "lang": "", "error": f"Whisper文字起こしがタイムアウトしました（{PER_ITEM_TIMEOUT}秒超過）"}
+    except Exception as e:
+        logger.warning("Whisper error: %s", e)
+        return {"title": title, "text": None, "lang": "", "error": "文字起こしエラー: Whisper処理に失敗しました"}
+    finally:
+        try:
+            os.remove(filepath)
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -927,14 +1029,36 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     active_ws_connections += 1
     rate_limiter = RateLimiter(WS_RATE_LIMIT, WS_RATE_WINDOW)
+    cancel_flag = {"cancelled": False}
+    current_task = None
+
+    async def check_cancel():
+        """バックグラウンドで stop メッセージを受信する"""
+        nonlocal cancel_flag
+        try:
+            while True:
+                msg = await websocket.receive_json()
+                if msg.get("action") == "stop":
+                    cancel_flag["cancelled"] = True
+                    logger.info("Stop requested by client")
+                    if current_task and not current_task.done():
+                        current_task.cancel()
+                    return msg
+                return msg
+        except Exception:
+            return None
 
     try:
         while True:
+            cancel_flag["cancelled"] = False
             data = await websocket.receive_json()
 
             # レート制限チェック
             if not rate_limiter.allow():
                 await websocket.send_json({"type": "error", "message": "リクエストが多すぎます。少し待ってから再試行してください。"})
+                continue
+
+            if data.get("action") == "stop":
                 continue
 
             action = data.get("action")
@@ -989,12 +1113,12 @@ async def websocket_endpoint(websocket: WebSocket):
                                 result = {"index": i, "type": "youtube", "title": title, "url": "", "lang": "", "lang_ja": "", "text": None, "error": "不正な動画IDです"}
                             else:
                                 yt_url = f"https://www.youtube.com/watch?v={vid}"
-                                tr = await run_with_timeout(partial(get_youtube_transcript, vid, tmp_dir=tmp_dir))
+                                tr = await transcribe_youtube_with_progress(vid, tmp_dir, websocket, i, cancel_flag)
                                 result = {
                                     "index": i, "type": "youtube",
                                     "title": tr["title"], "url": yt_url,
-                                    "lang": tr["lang"], "lang_ja": get_language_name_ja(tr["lang"]),
-                                    "text": tr["text"], "error": tr["error"], "source": tr.get("source", ""),
+                                    "lang": tr.get("lang", ""), "lang_ja": get_language_name_ja(tr.get("lang", "")),
+                                    "text": tr.get("text"), "error": tr.get("error"), "source": tr.get("source", ""),
                                 }
                         else:
                             media_url = item.get("url", "")
@@ -1156,12 +1280,12 @@ async def websocket_endpoint(websocket: WebSocket):
                     result = None
                     try:
                         if item["type"] == "youtube":
-                            tr = await run_with_timeout(partial(get_youtube_transcript, item["video_id"], tmp_dir=tmp_dir))
+                            tr = await transcribe_youtube_with_progress(item["video_id"], tmp_dir, websocket, i, cancel_flag)
                             result = {
                                 "index": i, "type": "youtube",
-                                "title": tr["title"], "url": item["url"],
-                                "lang": tr["lang"], "lang_ja": get_language_name_ja(tr["lang"]),
-                                "text": tr["text"], "error": tr["error"], "source": tr.get("source", ""),
+                                "title": tr["title"], "url": item.get("url", ""),
+                                "lang": tr.get("lang", ""), "lang_ja": get_language_name_ja(tr.get("lang", "")),
+                                "text": tr.get("text"), "error": tr.get("error"), "source": tr.get("source", ""),
                             }
                         else:
                             media_url = item["url"]
@@ -1262,12 +1386,12 @@ async def websocket_endpoint(websocket: WebSocket):
                         if item["type"] == "youtube":
                             vid = item["video_id"]
                             yt_url = f"https://www.youtube.com/watch?v={vid}"
-                            tr = await run_with_timeout(partial(get_youtube_transcript, vid, tmp_dir=tmp_dir))
+                            tr = await transcribe_youtube_with_progress(vid, tmp_dir, websocket, i, cancel_flag)
                             result = {
                                 "index": i, "type": "youtube",
                                 "title": tr["title"], "url": yt_url,
-                                "lang": tr["lang"], "lang_ja": get_language_name_ja(tr["lang"]),
-                                "text": tr["text"], "error": tr["error"], "source": tr.get("source", ""),
+                                "lang": tr.get("lang", ""), "lang_ja": get_language_name_ja(tr.get("lang", "")),
+                                "text": tr.get("text"), "error": tr.get("error"), "source": tr.get("source", ""),
                             }
                         elif item["type"] in ("audio", "video"):
                             media_url = item["url"]

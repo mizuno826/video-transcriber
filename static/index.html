@@ -351,7 +351,11 @@
             <div class="progress-track">
                 <div class="progress-fill" id="progressFill"></div>
             </div>
-            <div class="progress-text" id="progressText" style="margin-top:8px;margin-bottom:0">処理中...</div>
+            <div style="display:flex;align-items:center;gap:10px;margin-top:8px">
+                <div class="progress-text" id="progressText" style="margin-bottom:0;flex:1">処理中...</div>
+                <button class="btn btn-danger btn-sm" id="stopBtn" onclick="stopProcessing()" style="display:none;white-space:nowrap">停止</button>
+            </div>
+            <div id="stepText" style="color:#a78bfa;font-size:0.8rem;margin-top:6px;display:none"></div>
         </div>
 
         <div class="toolbar" id="toolbar" style="display:none">
@@ -375,6 +379,9 @@
             document.getElementById('progressSuccess').textContent = '0 成功';
             document.getElementById('progressFailed').textContent = '0 失敗';
             document.getElementById('progressElapsed').textContent = '0:00';
+            document.getElementById('stopBtn').style.display = 'inline-block';
+            document.getElementById('stepText').style.display = 'none';
+            document.getElementById('stepText').textContent = '';
             progressState.timerInterval = setInterval(updateElapsed, 1000);
         }
         function stopProgressTimer() {
@@ -416,7 +423,7 @@
         }
 
         let wsActivityTimer = null;
-        const WS_INACTIVITY_TIMEOUT = 660000; // 11分（サーバー側10分+余裕）
+        const WS_INACTIVITY_TIMEOUT = 1860000; // 31分（サーバー側30分+余裕）
 
         function resetWsTimer() {
             if (wsActivityTimer) clearTimeout(wsActivityTimer);
@@ -639,8 +646,13 @@
                 case 'progress':
                     document.getElementById('progressBar').style.display = 'block';
                     document.getElementById('progressText').textContent = msg.message;
+                    document.getElementById('stopBtn').style.display = 'inline-block';
                     document.querySelector('.progress-track').classList.add('pulse');
                     if (msg.total) progressState.total = msg.total;
+                    break;
+                case 'step':
+                    document.getElementById('stepText').style.display = 'block';
+                    document.getElementById('stepText').textContent = msg.message;
                     break;
                 case 'result':
                     document.querySelector('.progress-track').classList.remove('pulse');
@@ -679,12 +691,22 @@
             }
         }
 
+        function stopProcessing() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ action: 'stop' }));
+            }
+            showStatus('処理を中止しました', 'error');
+            resetUI();
+        }
+
         function resetUI() {
             document.getElementById('analyzeBtn').disabled = false;
             document.getElementById('searchBtn').disabled = false;
             document.getElementById('scanBtn').disabled = false;
             document.getElementById('directTranscribeBtn').disabled = false;
             document.getElementById('progressBar').style.display = 'none';
+            document.getElementById('stopBtn').style.display = 'none';
+            document.getElementById('stepText').style.display = 'none';
             stopProgressTimer();
         }
 
