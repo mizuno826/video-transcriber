@@ -896,9 +896,10 @@
                         document.getElementById('recordingText').style.display = 'block';
                         document.getElementById('recordingTextContent').textContent = msg.text;
                     }
-                    let completeMsg = `録音完了: ${msg.total_seconds}秒`;
-                    if (msg.saved_path) completeMsg += ` | 保存: ${msg.saved_path}`;
-                    showStatus(completeMsg, 'success');
+                    let recMsg = `録音完了: ${msg.total_seconds}秒`;
+                    if (msg.wav_path) recMsg += ` | WAV: ${msg.wav_path}`;
+                    if (msg.saved_path) recMsg += ` | TXT: ${msg.saved_path}`;
+                    showStatus(recMsg, 'success');
                     break;
                 case 'error':
                     resetRecordingUI();

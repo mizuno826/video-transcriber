@@ -1548,13 +1548,16 @@ async def websocket_endpoint(websocket: WebSocket):
 
                     # 録音バッファ
                     audio_buffer = []
+                    all_raw_frames = []  # 全録音データ（WAV保存用）
                     recording = {"active": True}
                     all_texts = []
-                    chunk_sec = 10  # 10秒ごとに文字起こし
+                    chunk_sec = 10
+                    transcribe_queue = []  # 文字起こし待ちキュー
 
                     def audio_callback(in_data, frame_count, time_info, status):
                         if recording["active"]:
                             audio_buffer.append(in_data)
+                            all_raw_frames.append(in_data)
                         return (in_data, pyaudio.paContinue)
 
                     stream = pa.open(
@@ -1572,25 +1575,61 @@ async def websocket_endpoint(websocket: WebSocket):
 
                     loop = asyncio.get_event_loop()
 
-                    try:
-                        while recording["active"]:
-                            # stopメッセージを非ブロッキングでチェック
+                    def transcribe_chunk(path):
+                        try:
+                            from faster_whisper import WhisperModel
+                            model = WhisperModel("medium", device="cpu", compute_type="int8")
+                            segments, info = model.transcribe(path, beam_size=5)
+                            text = " ".join(seg.text for seg in segments).strip()
+                            return {"text": text, "lang": info.language}
+                        except Exception as e:
+                            logger.warning("Chunk transcribe error: %s", e)
+                            return {"text": "", "lang": ""}
+                        finally:
                             try:
-                                msg = await asyncio.wait_for(websocket.receive_json(), timeout=1.0)
+                                os.remove(path)
+                            except OSError:
+                                pass
+
+                    try:
+                        # 文字起こしタスクを並行実行するためのリスト
+                        pending_transcribe = None
+
+                        while recording["active"]:
+                            # stopメッセージを非ブロッキングでチェック（0.5秒待ち）
+                            try:
+                                msg = await asyncio.wait_for(websocket.receive_json(), timeout=0.5)
                                 if msg.get("action") == "stop_recording":
                                     recording["active"] = False
+                                    logger.info("Recording stop requested")
                                     break
                             except asyncio.TimeoutError:
                                 pass
 
-                            # バッファが十分溜まったら文字起こし
-                            if len(audio_buffer) >= chunk_frames:
+                            # 前回の文字起こしが完了していたら結果を取得
+                            if pending_transcribe and pending_transcribe.done():
+                                try:
+                                    tr = pending_transcribe.result()
+                                    if tr["text"]:
+                                        all_texts.append(tr["text"])
+                                        await websocket.send_json({
+                                            "type": "recording_text",
+                                            "chunk_index": tr.get("idx", 0),
+                                            "text": tr["text"],
+                                            "lang": tr["lang"],
+                                            "elapsed": total_seconds,
+                                        })
+                                except Exception:
+                                    pass
+                                pending_transcribe = None
+
+                            # バッファが十分溜まったら文字起こし開始
+                            if len(audio_buffer) >= chunk_frames and pending_transcribe is None:
                                 chunk_data = b''.join(audio_buffer[:chunk_frames])
                                 del audio_buffer[:chunk_frames]
                                 chunk_index += 1
                                 total_seconds += chunk_sec
 
-                                # 無音チェック
                                 audio_array = np.frombuffer(chunk_data, dtype=np.int16)
                                 rms = np.sqrt(np.mean(audio_array.astype(float) ** 2))
                                 if rms < 50:
@@ -1601,7 +1640,6 @@ async def websocket_endpoint(websocket: WebSocket):
                                     })
                                     continue
 
-                                # WAVに保存して文字起こし
                                 chunk_path = os.path.join(tmp_dir, f"rec_chunk_{chunk_index}.wav")
                                 with wave.open(chunk_path, 'wb') as wf:
                                     wf.setnchannels(channels)
@@ -1615,32 +1653,29 @@ async def websocket_endpoint(websocket: WebSocket):
                                     "message": f"録音中... {total_seconds}秒 → 文字起こし中..."
                                 })
 
-                                def transcribe_chunk(path):
-                                    try:
-                                        from faster_whisper import WhisperModel
-                                        model = WhisperModel("medium", device="cpu", compute_type="int8")
-                                        segments, info = model.transcribe(path, beam_size=5)
-                                        text = " ".join(seg.text for seg in segments).strip()
-                                        return {"text": text, "lang": info.language}
-                                    except Exception as e:
-                                        logger.warning("Chunk transcribe error: %s", e)
-                                        return {"text": "", "lang": ""}
-                                    finally:
-                                        try:
-                                            os.remove(path)
-                                        except OSError:
-                                            pass
+                                # 文字起こしをバックグラウンドで開始（stopを受け取れるようにする）
+                                idx = chunk_index
+                                def do_transcribe(p=chunk_path, i=idx):
+                                    r = transcribe_chunk(p)
+                                    r["idx"] = i
+                                    return r
+                                pending_transcribe = loop.run_in_executor(None, do_transcribe)
 
-                                tr = await loop.run_in_executor(None, transcribe_chunk, chunk_path)
+                        # ループ終了後、保留中の文字起こしを完了
+                        if pending_transcribe:
+                            try:
+                                tr = await asyncio.wait_for(pending_transcribe, timeout=120)
                                 if tr["text"]:
                                     all_texts.append(tr["text"])
                                     await websocket.send_json({
                                         "type": "recording_text",
-                                        "chunk_index": chunk_index,
+                                        "chunk_index": tr.get("idx", 0),
                                         "text": tr["text"],
                                         "lang": tr["lang"],
                                         "elapsed": total_seconds,
                                     })
+                            except Exception:
+                                pass
 
                     finally:
                         recording["active"] = False
@@ -1653,7 +1688,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         remaining = b''.join(audio_buffer)
                         audio_array = np.frombuffer(remaining, dtype=np.int16)
                         rms = np.sqrt(np.mean(audio_array.astype(float) ** 2))
-                        if rms >= 50:
+                        if rms >= 50 and len(remaining) > 1000:
                             chunk_path = os.path.join(tmp_dir, f"rec_chunk_final.wav")
                             with wave.open(chunk_path, 'wb') as wf:
                                 wf.setnchannels(channels)
@@ -1671,17 +1706,36 @@ async def websocket_endpoint(websocket: WebSocket):
                                     "elapsed": total_seconds,
                                 })
 
-                    # 結果をファイル保存
+                    # 録音WAVファイルを保存
+                    wav_saved_path = ""
+                    if all_raw_frames:
+                        now = datetime.datetime.now()
+                        wav_dir = save_dir if save_dir else tmp_dir
+                        os.makedirs(wav_dir, exist_ok=True)
+                        wav_filename = f"録音_{now.strftime('%Y%m%d_%H%M%S')}.wav"
+                        wav_saved_path = os.path.join(os.path.normpath(wav_dir), wav_filename)
+                        try:
+                            with wave.open(wav_saved_path, 'wb') as wf:
+                                wf.setnchannels(channels)
+                                wf.setsampwidth(2)
+                                wf.setframerate(sample_rate)
+                                wf.writeframes(b''.join(all_raw_frames))
+                            logger.info("Recording WAV saved: %s", wav_saved_path)
+                        except Exception as e:
+                            logger.warning("WAV save error: %s", e)
+                            wav_saved_path = ""
+
+                    # 文字起こし結果をファイル保存
                     combined_text = "\n".join(all_texts)
-                    saved_path = ""
+                    txt_saved_path = ""
                     if combined_text and save_dir:
                         try:
                             now = datetime.datetime.now()
                             filename = f"録音文字起こし_{now.strftime('%Y%m%d_%H%M%S')}.txt"
-                            saved_path = os.path.join(os.path.normpath(save_dir), filename)
-                            os.makedirs(os.path.dirname(saved_path), exist_ok=True)
+                            txt_saved_path = os.path.join(os.path.normpath(save_dir), filename)
+                            os.makedirs(os.path.dirname(txt_saved_path), exist_ok=True)
                             header = f"デスクトップ録音 文字起こし\n録音日時: {now.strftime('%Y/%m/%d %H:%M:%S')}\n録音時間: {total_seconds}秒\n{'='*50}\n\n"
-                            with open(saved_path, "w", encoding="utf-8") as f:
+                            with open(txt_saved_path, "w", encoding="utf-8") as f:
                                 f.write(header + combined_text)
                         except Exception as e:
                             logger.warning("Save error: %s", e)
@@ -1691,7 +1745,8 @@ async def websocket_endpoint(websocket: WebSocket):
                         "total_seconds": total_seconds,
                         "chunks": chunk_index,
                         "text": combined_text,
-                        "saved_path": saved_path,
+                        "saved_path": txt_saved_path,
+                        "wav_path": wav_saved_path,
                     })
 
                 except Exception as e:
