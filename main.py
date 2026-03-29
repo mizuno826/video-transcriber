@@ -686,7 +686,7 @@ def transcribe_single_chunk(filepath: str) -> dict:
     """1つの音声ファイルを文字起こし（分割チャンク用）"""
     try:
         from faster_whisper import WhisperModel
-        model = WhisperModel("base", device="cpu", compute_type="int8")
+        model = WhisperModel("medium", device="cpu", compute_type="int8")
         segments, info = model.transcribe(filepath, beam_size=5)
         text = " ".join(seg.text for seg in segments)
         return {"text": text.strip(), "lang": info.language, "error": None}
@@ -703,7 +703,7 @@ def transcribe_local_file(filepath: str) -> dict:
     if file_size <= CHUNK_THRESHOLD_BYTES:
         try:
             from faster_whisper import WhisperModel
-            model = WhisperModel("base", device="cpu", compute_type="int8")
+            model = WhisperModel("medium", device="cpu", compute_type="int8")
             segments, info = model.transcribe(filepath, beam_size=5)
             text = " ".join(seg.text for seg in segments)
             lang = info.language
@@ -833,7 +833,7 @@ def transcribe_audio(url: str, tmp_dir: str) -> dict:
                 shutil.rmtree(chunk_dir, ignore_errors=True)
         else:
             from faster_whisper import WhisperModel
-            model = WhisperModel("base", device="cpu", compute_type="int8")
+            model = WhisperModel("medium", device="cpu", compute_type="int8")
             segments, info = model.transcribe(filepath, beam_size=5)
             text = " ".join(seg.text for seg in segments)
             return {"text": text.strip(), "lang": info.language, "error": None}
@@ -1037,7 +1037,7 @@ async def transcribe_youtube_with_progress(video_id, tmp_dir, websocket, item_in
     try:
         def run_whisper():
             from faster_whisper import WhisperModel
-            model = WhisperModel("base", device="cpu", compute_type="int8")
+            model = WhisperModel("medium", device="cpu", compute_type="int8")
             segments, info = model.transcribe(filepath, beam_size=5)
             text = " ".join(seg.text for seg in segments)
             return {"text": text.strip(), "lang": info.language, "error": None, "source": "Whisper音声認識"}
@@ -1618,7 +1618,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 def transcribe_chunk(path):
                                     try:
                                         from faster_whisper import WhisperModel
-                                        model = WhisperModel("base", device="cpu", compute_type="int8")
+                                        model = WhisperModel("medium", device="cpu", compute_type="int8")
                                         segments, info = model.transcribe(path, beam_size=5)
                                         text = " ".join(seg.text for seg in segments).strip()
                                         return {"text": text, "lang": info.language}
